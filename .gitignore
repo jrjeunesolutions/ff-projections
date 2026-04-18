@@ -1,0 +1,45 @@
+# MCP config contains an API key — keep out of git
+.mcp.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Data artifacts — regenerate from source
+data/raw/
+data/processed/
+*.parquet
+*.duckdb
+*.db
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Env files (safety guard — none currently present)
+.env
+.env.*
+!.env.example
+
+# Future cache / large-data directories (prophylactic — none exist yet)
+imported-data/
+backtest-cache/
+.cfbd_cache/
