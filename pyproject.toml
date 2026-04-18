@@ -25,6 +25,8 @@ dependencies = [
     # CLI
     "typer>=0.12.0",
     "rich>=13.7.0",
+    # Fuzzy name matching (prospect ↔ draft picks, Phase 8c Part 0.5)
+    "rapidfuzz>=3.9.0",
 ]
 
 [project.optional-dependencies]

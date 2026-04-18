@@ -91,7 +91,7 @@ Phase 8c Part 1 (breakout / usage-trend signal).
   baseline is 0.739 on this cell, meaning the model currently loses
   to both FP and the naive baseline. Part 0.5 was added after
   discovering the current rookie layer
-  (`nfl_proj/player/rookies/models.py`) is round-bucket-only and
+  (`nfl_proj/rookies/models.py`) is round-bucket-only and
   consumes no prospect signal; as a result Brian Thomas Jr. and Malik
   Nabers got **identical** 2024 projections despite being clearly
   differentiable prospects. Fixing that is sequenced before the
