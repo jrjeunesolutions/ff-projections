@@ -1,16 +1,34 @@
 """
 Phase 8c Part 1: per-player breakout / usage-trend signal.
 
-Predicts year-over-year share delta (target_share for WR/TE, rush_share
-for RB) from four structural features, to be added as a bounded
-adjustment on top of the Phase 4 opportunity projection.
+Predicts the Phase-4 residual (actual share minus the Phase 4 opportunity
+projection) from three structural change-features, to be added as a
+bounded adjustment on top of the Phase 4 opportunity projection.
 
-Architecture (per spec §1.3 — share-delta model, NOT a fantasy-point
-residual model):
+Architecture (share-delta model, NOT a fantasy-point residual model):
 
-    projected_share = role_prior
-                      + ridge_residual (Phase 4)
-                      + breakout_adjustment(features)   <-- this module
+    projected_share = phase4_role_prior          (prior1-based)
+                      + phase4_ridge_residual    (Phase 4 Ridge residual)
+                      + breakout_adjustment      (this module)
+
+    breakout training target:
+        y = actual_share[t+1] - phase4_pred[t+1]
+
+    where ``phase4_pred[t+1] = role_prior + ridge_residual`` comes from
+    running the existing ``project_opportunity`` on a target-season-
+    appropriate context. The breakout model thus learns the Phase-4
+    residual that structural change-features can explain -- NOT the raw
+    share delta, which naturally regresses-to-mean and causes the model
+    to learn "vets trend down" via any prior-volume proxy.
+
+    This architecture choice is why ``career_year`` was REMOVED from the
+    feature set (Commit A-prime): in the raw-delta target regime career_
+    year correlated with prior usage strongly enough to absorb all the
+    mean-reversion signal and force every named expected-breakout
+    candidate negative. Against the phase4-residual target, age/
+    experience effects are already absorbed by the Phase 4 projection,
+    so the remaining residual is genuinely about *change* -- where
+    usage_trend and departing_opp_share belong.
 
 Features:
     usage_trend_late    — (late-season share) minus (full-season share),
@@ -19,21 +37,32 @@ Features:
                           prior year. Stronger finish signal.
     departing_opp_share — prior-year same-position share on current team
                           that is no longer on the roster.
-    depth_chart_delta   — prior-year-end depth rank minus current-year
-                          preseason depth rank (positive = moved up).
-                          Falls back to 0 when target-year preseason
-                          depth charts are not published. NOTE: the
-                          nflverse ``depth_charts`` dataset currently
-                          contains NO preseason (PRE) rows for any year
-                          (only REG + playoffs), so this feature is
-                          effectively dormant (always 0) until a
-                          preseason source is wired in. Ridge simply
-                          assigns it ~0 coefficient; kept in the schema
-                          so future preseason data flows through
-                          without code changes.
-    career_year         — target_season minus first-season + 1.
 
-Training: 2016..2022, one Ridge per position (WR, RB, TE).
+Removed from the active feature vector:
+    career_year         — REMOVED (Commit A-prime). In the raw-delta
+                          target regime this proxied for prior share and
+                          absorbed pure mean-reversion signal, negating
+                          every named expected-breakout candidate. If
+                          age/experience is revisited later, use a
+                          position-specific quadratic age curve centered
+                          at peak age (NOT monotonic career_year). The
+                          ``career_year_feature`` helper is still
+                          exposed for eligibility gating (career_year <
+                          2 => rookie => routed to the rookies module).
+    depth_chart_delta   — REMOVED from FEATURES tuple (Commit A-prime).
+                          nflverse ``depth_charts`` contains ZERO PRE
+                          (preseason) rows for any year (only REG +
+                          playoffs), so the feature is dormant (always
+                          0) in the current pipeline. TODO: wire a
+                          preseason depth-chart source and add it back.
+                          The ``depth_chart_delta_feature`` helper is
+                          kept in the module for future use.
+
+Training: 2016..2022, one Ridge per position (WR, RB, TE). Each training
+fold rebuilds a year-specific BacktestContext so the features (team
+assignments, prior-year shares) use point-in-time inputs without the
+target-season ctx leaking future team-assignment data backward.
+
 Validation holdout: 2023, 2024. Fit-on-the-fly per `project_breakout(ctx)`
 call, no disk cache (matches `nfl_proj.player.qb` and
 `nfl_proj.rookies.models` patterns).
@@ -133,13 +162,18 @@ POOLED_FALLBACK_MIN_ROWS: int = 400
 COVID_YEAR: int = 2020
 COVID_Z_THRESHOLD: float = 2.0
 
-# Feature ordering — stable tuple used for Ridge X columns.
+# Feature ordering -- stable tuple used for Ridge X columns.
+#
+# Commit A-prime (2026-04-18): ``career_year`` and ``depth_chart_delta``
+# were removed. career_year was absorbing mean-reversion signal in the
+# raw-delta target regime (see module docstring); depth_chart_delta is
+# dormant because nflverse has no preseason depth-chart rows. The three
+# remaining features are all change-oriented, which is appropriate for
+# the phase4-residual target.
 FEATURES: tuple[str, ...] = (
     "usage_trend_late",
     "usage_trend_finish",
     "departing_opp_share",
-    "depth_chart_delta",
-    "career_year",
 )
 
 # Pooled Ridge adds position one-hots (RB is the reference level).
@@ -387,11 +421,19 @@ def depth_chart_delta_feature(
 
     Prior-year source: end-of-regular-season (max REG week) depth chart.
     Current-year source: latest preseason (PRE) depth chart.
-    If current-year PRE is empty (common at Aug-15 cutoff — nflverse
+    If current-year PRE is empty (common at Aug-15 cutoff -- nflverse
     publishes preseason depth later in August), we fall back to the
     prior-year end-of-season rank as the current proxy, which yields
     delta = 0 for every returning player. This is the correct behavior
-    per spec §Q5 ("the signal is genuinely 'nothing changed'").
+    per spec section Q5 ("the signal is genuinely 'nothing changed'").
+
+    TODO (Phase 9+): nflverse ``depth_charts`` currently has ZERO PRE
+    rows for any year -- this function hits the prior-year fallback on
+    every call. Wire a preseason depth-chart source (ESPN or
+    FantasyPros JSON endpoints, PFR preseason depth pages) so this
+    feature produces non-zero deltas. Until then the feature is kept
+    as a helper but is NOT in the active FEATURES tuple (see module
+    header).
     """
     prior = depth_chart_snapshot(
         depth_charts, season=target_season - 1, game_type="REG"
@@ -629,46 +671,97 @@ def _filter_eligible(frame: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def _role_prior_for_target(as_of_date: str) -> pl.DataFrame:
+    """
+    Returns (player_id, role_prior_ts, role_prior_rs) for the target
+    season implied by ``as_of_date``, using the existing Phase 4
+    opportunity model (pre-breakout).
+
+    This is the "phase4_pred" that the breakout model learns a residual
+    over. Built by running ``project_opportunity`` on a fresh, target-
+    year-specific BacktestContext (as_of=``<target>-08-15``). Rebuilding
+    per year is required: if we reused the caller's ctx, historical
+    training folds would see future team assignments / depth info.
+
+    This is slow (~5-10s per fold depending on cache state) but is only
+    called during training.
+    """
+    # Local import to avoid a circular dependency at module load time --
+    # opportunity/models.py and breakout.py are peer modules under
+    # nfl_proj.
+    from nfl_proj.opportunity.models import project_opportunity
+
+    sub_ctx = BacktestContext.build(as_of_date=as_of_date)
+    op = project_opportunity(sub_ctx)
+    return op.projections.select(
+        "player_id",
+        pl.col("target_share_pred").alias("role_prior_ts"),
+        pl.col("rush_share_pred").alias("role_prior_rs"),
+    )
+
+
 def build_training_frame(ctx: BacktestContext) -> pl.DataFrame:
     """
-    For each target_year Y in [TRAIN_START+1 .. TRAIN_END+1], build
-    features (as of end of Y-1) and the actual share delta from Y-1 to Y.
-    Concatenates into a single frame. Eligibility gate is applied at the
-    end.
+    For each target_year T in [TRAIN_START+1 .. TRAIN_END+1], build
+    features at as-of = T-08-15 AND the phase4-residual target:
+
+        y = actual_share[T] - phase4_role_prior_share[T]
+
+    where ``phase4_role_prior_share`` is the existing opportunity-
+    model's projection for T (pre-breakout). Each training fold uses
+    a FRESH BacktestContext at as_of=``<T>-08-15`` so feature inputs
+    respect the point-in-time cutoff and cannot see future team
+    assignments / roster moves.
+
+    Concatenates folds into a single frame. Eligibility gate is applied
+    at the end.
     """
-    psw = ctx.player_stats_week
-    full_shares = _player_season_window_shares(psw).select(
+    # Full-season actual shares -- these are the "actual_share[T]" side
+    # of the target. Pull them once from the caller's ctx (covers all
+    # seasons needed as long as the ctx spans through TRAIN_END + 1
+    # which it always does -- DEFAULT_SEASONS is 2012..current).
+    full_shares = _player_season_window_shares(ctx.player_stats_week).select(
         "player_id",
         "season",
         pl.col("target_share"),
         pl.col("rush_share"),
     )
+
     rows: list[pl.DataFrame] = []
     for y in range(TRAIN_START, TRAIN_END + 1):
-        target = y + 1  # we model the delta Y -> Y+1 using features as of Y
-        feats = build_breakout_features(ctx, target_season=target)
-        y_shares = full_shares.filter(pl.col("season") == y).select(
+        target = y + 1
+        as_of = f"{target}-08-15"
+
+        # Features -- point-in-time at the training fold's as-of.
+        fold_ctx = BacktestContext.build(as_of_date=as_of)
+        feats = build_breakout_features(fold_ctx, target_season=target)
+
+        # Phase-4 role prior for the target fold (already includes the
+        # Phase 4 Ridge residual; that's the whole point -- the breakout
+        # model learns what Phase 4 *missed*).
+        role_prior = _role_prior_for_target(as_of)
+
+        # Actual full-season share at target year.
+        actual = full_shares.filter(pl.col("season") == target).select(
             "player_id",
-            pl.col("target_share").alias("ts_y"),
-            pl.col("rush_share").alias("rs_y"),
+            pl.col("target_share").alias("actual_ts"),
+            pl.col("rush_share").alias("actual_rs"),
         )
-        y1_shares = full_shares.filter(pl.col("season") == target).select(
-            "player_id",
-            pl.col("target_share").alias("ts_y1"),
-            pl.col("rush_share").alias("rs_y1"),
-        )
-        joined = feats.join(y_shares, on="player_id", how="left").join(
-            y1_shares, on="player_id", how="left"
+
+        joined = (
+            feats.join(role_prior, on="player_id", how="left")
+            .join(actual, on="player_id", how="left")
         )
         joined = joined.with_columns(
             pl.when(pl.col("position").is_in(["WR", "TE"]))
-            .then(pl.col("ts_y1") - pl.col("ts_y"))
+            .then(pl.col("actual_ts") - pl.col("role_prior_ts"))
             .when(pl.col("position") == "RB")
-            .then(pl.col("rs_y1") - pl.col("rs_y"))
+            .then(pl.col("actual_rs") - pl.col("role_prior_rs"))
             .otherwise(None)
             .alias("share_delta")
         ).filter(pl.col("share_delta").is_not_null())
         rows.append(joined)
+
     if not rows:
         raise RuntimeError("build_training_frame: no rows produced")
     training = pl.concat(rows, how="diagonal").sort(["player_id", "target_season"])
@@ -891,7 +984,14 @@ def project_breakout(ctx: BacktestContext) -> BreakoutArtifacts:
     training = build_training_frame(ctx)
     training, excluded = _maybe_exclude_2020(training)
     models, pooled_fallback, diagnostics = fit_breakout_models(training)
+
     inference = build_breakout_features(ctx, target_season=tgt)
+    # Attach phase4 role prior to the inference frame so downstream
+    # (Commit B integration, validation) can see actual - role_prior -
+    # breakout_adj decompositions.
+    role_prior = _role_prior_for_target(str(ctx.as_of_date))
+    inference = inference.join(role_prior, on="player_id", how="left")
+
     return BreakoutArtifacts(
         target_season=tgt,
         features=inference,
