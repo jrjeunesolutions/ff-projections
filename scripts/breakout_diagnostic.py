@@ -101,7 +101,8 @@ def main() -> None:
         "player_display_name", "position", "current_team", "career_year",
         "prior_year_touches",
         "usage_trend_late", "usage_trend_finish",
-        "departing_opp_share", "depth_chart_delta",
+        "departing_opp_share", "departing_opp_share_sqrt",
+        "depth_chart_delta",
     ]
     print("\nNamed 2024 candidates -- raw feature values:")
     print(sample.select(cols_to_show))
@@ -131,6 +132,7 @@ def main() -> None:
         elig.select("player_id", "player_display_name", "position",
                     "current_team", "career_year",
                     "usage_trend_late", "departing_opp_share",
+                    "departing_opp_share_sqrt",
                     "depth_chart_delta")
         .join(adj, on=["player_id", "position"], how="inner")
     )

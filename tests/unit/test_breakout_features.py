@@ -433,7 +433,10 @@ def _make_models(*, per_pos: dict[str, float]) -> dict[str, bk.BreakoutModel]:
 
 
 def _inference_frame(rows: list[dict]) -> pl.DataFrame:
-    # Make sure all expected feature cols exist with defaults.
+    # Make sure all expected feature cols exist with defaults. The sqrt
+    # transform is applied here to match what build_breakout_features
+    # produces downstream; tests that specify a raw departing_opp_share
+    # get the sqrt computed automatically.
     defaults = {
         "usage_trend_late": 0.0, "usage_trend_finish": 0.0,
         "departing_opp_share": 0.0, "depth_chart_delta": 0,
@@ -443,6 +446,7 @@ def _inference_frame(rows: list[dict]) -> pl.DataFrame:
     for r in rows:
         d = dict(defaults)
         d.update(r)
+        d["departing_opp_share_sqrt"] = float(d["departing_opp_share"]) ** 0.5
         filled.append(d)
     return pl.DataFrame(
         filled,
@@ -526,12 +530,14 @@ def _synthetic_training(per_pos_n: dict[str, int]) -> pl.DataFrame:
     for pos, n in per_pos_n.items():
         for _ in range(n):
             pid += 1
+            dep = float(rng.uniform(0, 0.15))
             rows.append({
                 "player_id": f"P{pid}",
                 "position": pos,
                 "usage_trend_late": float(rng.normal(0, 0.02)),
                 "usage_trend_finish": float(rng.normal(0, 0.02)),
-                "departing_opp_share": float(rng.uniform(0, 0.15)),
+                "departing_opp_share": dep,
+                "departing_opp_share_sqrt": dep ** 0.5,
                 "depth_chart_delta": int(rng.integers(-1, 2)),
                 "career_year": int(rng.integers(2, 8)),
                 "share_delta": float(rng.normal(0, 0.03)),

@@ -31,12 +31,27 @@ Architecture (share-delta model, NOT a fantasy-point residual model):
     usage_trend and departing_opp_share belong.
 
 Features:
-    usage_trend_late    — (late-season share) minus (full-season share),
-                          prior year. Signals role expansion.
-    usage_trend_finish  — (last-4-games share) minus (full-season share),
-                          prior year. Stronger finish signal.
-    departing_opp_share — prior-year same-position share on current team
-                          that is no longer on the roster.
+    usage_trend_late         — (late-season share) minus (full-season
+                               share), prior year. Signals role expansion.
+    usage_trend_finish       — (last-4-games share) minus (full-season
+                               share), prior year. Stronger finish signal.
+    departing_opp_share_sqrt — sqrt-transformed prior-year same-position
+                               share on current team that is no longer on
+                               the roster. Raw ``departing_opp_share`` is
+                               still emitted (audit) but is NOT in the
+                               modeling feature tuple.
+
+Pre-correction: sqrt transform on ``departing_opp_share``.
+    Applied pre-integration (Commit A-prime-prime) to compress
+    RB-vacancy cases. Commit A-prime diagnostic showed Singletary/White
+    at +0.067 on full-bellcow-vacated teams -- an unrealistic "the
+    entire RB1 share transfers linearly" assumption. Historical base
+    rate for RB share inheritance is concave: when an RB1 leaves, the
+    replacement typically inherits a fraction of the vacated work, with
+    committee fill-in taking the remainder. The sqrt transform encodes
+    this diminishing-returns structure as a fixed nonlinearity before
+    the Ridge fit, rather than hoping a linear model picks it up. No
+    post-hoc tuning to validation metrics.
 
 Removed from the active feature vector:
     career_year         — REMOVED (Commit A-prime). In the raw-delta
@@ -170,10 +185,14 @@ COVID_Z_THRESHOLD: float = 2.0
 # dormant because nflverse has no preseason depth-chart rows. The three
 # remaining features are all change-oriented, which is appropriate for
 # the phase4-residual target.
+#
+# Commit A-prime-prime (2026-04-18): replaced raw ``departing_opp_share``
+# with ``departing_opp_share_sqrt`` to encode the concave base rate for
+# vacated-share inheritance (see module docstring pre-correction note).
 FEATURES: tuple[str, ...] = (
     "usage_trend_late",
     "usage_trend_finish",
-    "departing_opp_share",
+    "departing_opp_share_sqrt",
 )
 
 # Pooled Ridge adds position one-hots (RB is the reference level).
@@ -653,6 +672,13 @@ def build_breakout_features(
         pl.col("career_year").fill_null(1).cast(pl.Int64),
         pl.col("prior_year_touches").fill_null(0).cast(pl.Int64),
         pl.lit(tgt).cast(pl.Int32).alias("target_season"),
+    )
+    # Commit A-prime-prime: sqrt transform for departing_opp_share.
+    # Raw column is kept (audit / diagnostic display); the modeling
+    # feature is the sqrt version. departing_opp_share is always in
+    # [0, 1] after fill_null, so sqrt is defined everywhere.
+    frame = frame.with_columns(
+        pl.col("departing_opp_share").sqrt().alias("departing_opp_share_sqrt"),
     )
     return frame
 
