@@ -13,6 +13,33 @@ deep bench players.
 
 Rookies are out of scope here (they have no priors) and are handled
 separately in Phase 6.
+
+Phase 8c Part 1 Commit B -- breakout integration (Architecture A):
+    After the phase-4 Ridge produces ``target_share_pred`` /
+    ``rush_share_pred`` (= prior1 + ridge_residual, clipped [0, 0.50]),
+    the ``project_breakout`` model emits per-eligible-player adjustments
+    that are ADDED on top of phase-4 and re-clipped to [0, 0.50]:
+
+        final_ts = clip(phase4_ts_pred + breakout_adj_ts, 0, 0.50)
+        final_rs = clip(phase4_rs_pred + breakout_adj_rs, 0, 0.50)
+
+    Breakout adjustments are already per-position-capped inside
+    ``apply_breakout_adjustment`` (WR 0.08, TE 0.06, RB 0.12), so no
+    additional clip is applied on the adjustment itself. The only clip
+    at integration time is the final share clip.
+
+    The projections frame preserves both the pre- and post-breakout
+    shares so downstream (scoring, validation) can attribute what the
+    breakout layer contributed per player:
+
+        target_share_pred_pre_breakout    target_share_pred   breakout_adjustment_ts
+        rush_share_pred_pre_breakout      rush_share_pred     breakout_adjustment_rs
+
+    ``apply_breakout=False`` escape hatch: used by
+    ``nfl_proj.player.breakout._role_prior_for_target`` to fetch the
+    phase-4 role prior while TRAINING the breakout model itself (would
+    otherwise cause infinite recursion). Downstream callers should
+    leave ``apply_breakout=True`` (default).
 """
 
 from __future__ import annotations
@@ -243,8 +270,24 @@ def _predict_share(trained: ShareModel, history: pl.DataFrame) -> pl.DataFrame:
 
 
 def project_opportunity(
-    ctx: BacktestContext, *, alpha: float = 1.0
+    ctx: BacktestContext, *, alpha: float = 1.0, apply_breakout: bool = True
 ) -> OpportunityProjection:
+    """
+    Phase 4 share projection, optionally augmented by the Phase 8c
+    Commit B breakout adjustment.
+
+    ``apply_breakout``:
+        ``True`` (default): run the breakout module on the same ctx and
+        add its per-eligible-player adjustment to the phase-4 output
+        (Architecture A). Output frame carries both pre- and post-
+        breakout columns plus the adjustment itself.
+
+        ``False``: return phase-4 projections only. Used internally by
+        ``breakout._role_prior_for_target`` while fitting the breakout
+        model (otherwise we recurse). Output frame still carries the
+        ``*_pre_breakout`` columns (identical to ``*_pred``) and the
+        adjustment columns set to 0.0, so downstream schema is stable.
+    """
     history = build_player_season_opportunity(ctx)
 
     # Manufacture target-season rows for any player with a prior1 above
@@ -305,7 +348,70 @@ def project_opportunity(
         how="full",
         coalesce=True,
     )
-    target = joined.filter(pl.col("season") == tgt).sort(
+    target = joined.filter(pl.col("season") == tgt)
+
+    # Preserve the phase-4 (pre-breakout) predictions before any further
+    # adjustment -- scoring + validation will want both the pre- and
+    # post-breakout shares for per-player breakout attribution.
+    target = target.with_columns(
+        pl.col("target_share_pred").alias("target_share_pred_pre_breakout"),
+        pl.col("rush_share_pred").alias("rush_share_pred_pre_breakout"),
+    )
+
+    # Phase 8c Part 1 Commit B -- Architecture A (additive) breakout
+    # integration. Adjustments come out of ``project_breakout`` already
+    # per-position-capped; the only clip at integration time is the
+    # final share clip.
+    if apply_breakout:
+        # Local import -- breakout.py imports this module (via
+        # ``_role_prior_for_target``), so a module-level import would be
+        # circular.
+        from nfl_proj.player.breakout import (
+            apply_breakout_adjustment,
+            project_breakout,
+        )
+
+        bk_art = project_breakout(ctx)
+        adj = apply_breakout_adjustment(
+            bk_art.models,
+            bk_art.features,
+            pooled_fallback=bk_art.pooled_fallback,
+        )
+        # Position routing -- WR/TE adjust target_share; RB adjusts
+        # rush_share. A player never carries both simultaneously by
+        # construction (position is a single string), so the two joins
+        # never collide.
+        adj_ts = adj.filter(pl.col("position").is_in(["WR", "TE"])).select(
+            "player_id", pl.col("breakout_adjustment").alias("breakout_adjustment_ts"),
+        )
+        adj_rs = adj.filter(pl.col("position") == "RB").select(
+            "player_id", pl.col("breakout_adjustment").alias("breakout_adjustment_rs"),
+        )
+        target = (
+            target.join(adj_ts, on="player_id", how="left")
+            .join(adj_rs, on="player_id", how="left")
+            .with_columns(
+                pl.col("breakout_adjustment_ts").fill_null(0.0),
+                pl.col("breakout_adjustment_rs").fill_null(0.0),
+            )
+            .with_columns(
+                (pl.col("target_share_pred") + pl.col("breakout_adjustment_ts"))
+                .clip(0.0, 0.50)
+                .alias("target_share_pred"),
+                (pl.col("rush_share_pred") + pl.col("breakout_adjustment_rs"))
+                .clip(0.0, 0.50)
+                .alias("rush_share_pred"),
+            )
+        )
+    else:
+        # Escape hatch for breakout's own role-prior lookup. Emit zero
+        # adjustment columns so downstream schema is stable.
+        target = target.with_columns(
+            pl.lit(0.0).alias("breakout_adjustment_ts"),
+            pl.lit(0.0).alias("breakout_adjustment_rs"),
+        )
+
+    target = target.sort(
         "target_share_pred", descending=True, nulls_last=True,
     )
     return OpportunityProjection(

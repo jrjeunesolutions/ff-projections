@@ -715,10 +715,16 @@ def _role_prior_for_target(as_of_date: str) -> pl.DataFrame:
     # Local import to avoid a circular dependency at module load time --
     # opportunity/models.py and breakout.py are peer modules under
     # nfl_proj.
+    #
+    # ``apply_breakout=False`` is CRITICAL: Commit B wiring makes
+    # project_opportunity call back into this module, which would
+    # otherwise cause infinite recursion. We only need phase-4 priors
+    # for breakout training/inference feature attachment, not the
+    # breakout-augmented share.
     from nfl_proj.opportunity.models import project_opportunity
 
     sub_ctx = BacktestContext.build(as_of_date=as_of_date)
-    op = project_opportunity(sub_ctx)
+    op = project_opportunity(sub_ctx, apply_breakout=False)
     return op.projections.select(
         "player_id",
         pl.col("target_share_pred").alias("role_prior_ts"),
