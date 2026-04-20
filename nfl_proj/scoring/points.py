@@ -195,19 +195,10 @@ def _veteran_counting_stats(
       last_team    (player_id, team) — fallback target-season team
       team_volumes (team, team_targets, team_carries)
     """
-    # Source frames.
-    #
-    # Phase 8c Part 1 Commit B: pre-breakout shares and the breakout
-    # adjustment are passed through to the scoring frame so the
-    # validation harness can do per-player breakout attribution without
-    # re-running project_opportunity separately. Downstream counting-
-    # stat computation uses the post-breakout ``*_pred`` columns (which
-    # are identical to ``*_pred_pre_breakout`` when apply_breakout=False).
+    # Source frames
     opp_f = opp.projections.select(
         "player_id", "player_display_name", "position",
         "target_share_pred", "rush_share_pred",
-        "target_share_pred_pre_breakout", "rush_share_pred_pre_breakout",
-        "breakout_adjustment_ts", "breakout_adjustment_rs",
     )
     eff_f = eff.projections.select(
         "player_id",
@@ -318,14 +309,6 @@ def _veteran_counting_stats(
         "targets_pred", "carries_pred", "receptions_pred",
         "rec_yards_pred", "rush_yards_pred",
         "rec_tds_pred", "rush_tds_pred",
-        # Phase 8c Commit B -- breakout attribution columns preserved
-        # all the way from opportunity → scoring so per-player breakout
-        # contribution is inspectable in the validation harness. The
-        # diagonal_relaxed concat below fills these with nulls for QBs
-        # and rookies (neither goes through the veteran breakout path).
-        "target_share_pred", "rush_share_pred",
-        "target_share_pred_pre_breakout", "rush_share_pred_pre_breakout",
-        "breakout_adjustment_ts", "breakout_adjustment_rs",
     )
 
 

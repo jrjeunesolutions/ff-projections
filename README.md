@@ -95,7 +95,19 @@ Phase 8c Part 1 (breakout / usage-trend signal).
   consumes no prospect signal; as a result Brian Thomas Jr. and Malik
   Nabers got **identical** 2024 projections despite being clearly
   differentiable prospects. Fixing that is sequenced before the
-  breakout work.
+  breakout work. **Part 1 status:** infrastructure shipped
+  (`project_breakout`, `apply_breakout_adjustment`, Ridge on
+  4-feature usage-trend + vacancy + depth-chart signal) but the
+  integration into `project_opportunity` was rolled back after
+  validation showed noise-level signal on every original-spec gate
+  — see [`reports/phase8c_part1_postmortem.md`](reports/phase8c_part1_postmortem.md).
+  The Phase 8c Part 1 success criterion (RB 2024 Spearman ρ ≥ 0.665)
+  is carried forward to **Part 2a**, scoped against a falsifiable
+  prediction in the postmortem: adding player-quality features
+  (draft capital, prior-year YPRR/YPT, age, snap-share quality) to
+  the same Ridge architecture should produce ≥15% named-breakout
+  shrinkage (ex-A.J. Brown) and ≥0.020 RB 2024 Spearman improvement;
+  if it doesn't, Part 2b (two-stage / quantile) follows.
 
 ## Backtest scorecard vs naive baseline (2023 / 2024 / 2025)
 

@@ -14,32 +14,23 @@ deep bench players.
 Rookies are out of scope here (they have no priors) and are handled
 separately in Phase 6.
 
-Phase 8c Part 1 Commit B -- breakout integration (Architecture A):
-    After the phase-4 Ridge produces ``target_share_pred`` /
-    ``rush_share_pred`` (= prior1 + ridge_residual, clipped [0, 0.50]),
-    the ``project_breakout`` model emits per-eligible-player adjustments
-    that are ADDED on top of phase-4 and re-clipped to [0, 0.50]:
+Phase 8c Part 1 breakout integration — ROLLED BACK after validation:
+    Commit B originally wired ``project_breakout`` into this module
+    additively (``final = clip(phase4_pred + breakout_adj, 0, 0.50)``)
+    with a default ``apply_breakout=True``. Post-integration validation
+    landed an INFRASTRUCTURE ONLY verdict — all three original-spec
+    hard gates (WR+RB 2024 MAE lift, named 2024 breakout shrinkage,
+    RB 2024 Spearman) failed at noise level. See
+    ``reports/phase8c_part1_postmortem.md`` for details.
 
-        final_ts = clip(phase4_ts_pred + breakout_adj_ts, 0, 0.50)
-        final_rs = clip(phase4_rs_pred + breakout_adj_rs, 0, 0.50)
-
-    Breakout adjustments are already per-position-capped inside
-    ``apply_breakout_adjustment`` (WR 0.08, TE 0.06, RB 0.12), so no
-    additional clip is applied on the adjustment itself. The only clip
-    at integration time is the final share clip.
-
-    The projections frame preserves both the pre- and post-breakout
-    shares so downstream (scoring, validation) can attribute what the
-    breakout layer contributed per player:
-
-        target_share_pred_pre_breakout    target_share_pred   breakout_adjustment_ts
-        rush_share_pred_pre_breakout      rush_share_pred     breakout_adjustment_rs
-
-    ``apply_breakout=False`` escape hatch: used by
-    ``nfl_proj.player.breakout._role_prior_for_target`` to fetch the
-    phase-4 role prior while TRAINING the breakout model itself (would
-    otherwise cause infinite recursion). Downstream callers should
-    leave ``apply_breakout=True`` (default).
+    The toggle is retained for harness experimentation
+    (``scripts/breakout_integration_validation.py`` exercises both
+    paths) and for future Part 2a work (player-quality features on the
+    same Ridge architecture), but the default is now ``False``. When
+    ``apply_breakout=False`` the output frame carries only the phase-4
+    prediction columns; when ``apply_breakout=True`` it additionally
+    emits the pre-breakout shares and the per-position adjustments
+    for attribution.
 """
 
 from __future__ import annotations
@@ -270,23 +261,26 @@ def _predict_share(trained: ShareModel, history: pl.DataFrame) -> pl.DataFrame:
 
 
 def project_opportunity(
-    ctx: BacktestContext, *, alpha: float = 1.0, apply_breakout: bool = True
+    ctx: BacktestContext, *, alpha: float = 1.0, apply_breakout: bool = False
 ) -> OpportunityProjection:
     """
-    Phase 4 share projection, optionally augmented by the Phase 8c
-    Commit B breakout adjustment.
+    Phase 4 share projection, with an optional (default-off) Phase 8c
+    breakout adjustment layer retained for harness experimentation.
 
     ``apply_breakout``:
-        ``True`` (default): run the breakout module on the same ctx and
-        add its per-eligible-player adjustment to the phase-4 output
-        (Architecture A). Output frame carries both pre- and post-
-        breakout columns plus the adjustment itself.
+        ``False`` (default): return phase-4 projections only. This is
+        the production path after the Phase 8c Part 1 rollback. Output
+        frame contains the standard phase-4 columns; no breakout
+        attribution columns are emitted.
 
-        ``False``: return phase-4 projections only. Used internally by
-        ``breakout._role_prior_for_target`` while fitting the breakout
-        model (otherwise we recurse). Output frame still carries the
-        ``*_pre_breakout`` columns (identical to ``*_pred``) and the
-        adjustment columns set to 0.0, so downstream schema is stable.
+        ``True``: run the breakout module on the same ctx and add its
+        per-eligible-player adjustment to the phase-4 output
+        (Architecture A). Output frame additionally carries
+        ``target_share_pred_pre_breakout`` /
+        ``rush_share_pred_pre_breakout`` and
+        ``breakout_adjustment_ts`` / ``breakout_adjustment_rs`` for
+        attribution. Used by the validation harness to compare
+        on-vs-off and by Part 2a experimentation.
     """
     history = build_player_season_opportunity(ctx)
 
@@ -350,19 +344,21 @@ def project_opportunity(
     )
     target = joined.filter(pl.col("season") == tgt)
 
-    # Preserve the phase-4 (pre-breakout) predictions before any further
-    # adjustment -- scoring + validation will want both the pre- and
-    # post-breakout shares for per-player breakout attribution.
-    target = target.with_columns(
-        pl.col("target_share_pred").alias("target_share_pred_pre_breakout"),
-        pl.col("rush_share_pred").alias("rush_share_pred_pre_breakout"),
-    )
-
-    # Phase 8c Part 1 Commit B -- Architecture A (additive) breakout
-    # integration. Adjustments come out of ``project_breakout`` already
-    # per-position-capped; the only clip at integration time is the
-    # final share clip.
+    # Phase 8c Part 1 breakout layer — off by default after the Part 1
+    # rollback. When enabled (harness + Part 2a experimentation), the
+    # pre-breakout shares and per-position adjustments are emitted as
+    # additional columns for attribution; the ``*_pred`` columns carry
+    # the post-breakout, clipped values. Adjustments are already
+    # per-position-capped inside ``apply_breakout_adjustment`` (WR 0.08,
+    # TE 0.06, RB 0.12); the only clip at integration time is the final
+    # share clip to [0, 0.50].
     if apply_breakout:
+        # Preserve the phase-4 (pre-breakout) predictions for
+        # per-player attribution before the additive adjustment.
+        target = target.with_columns(
+            pl.col("target_share_pred").alias("target_share_pred_pre_breakout"),
+            pl.col("rush_share_pred").alias("rush_share_pred_pre_breakout"),
+        )
         # Local import -- breakout.py imports this module (via
         # ``_role_prior_for_target``), so a module-level import would be
         # circular.
@@ -402,13 +398,6 @@ def project_opportunity(
                 .clip(0.0, 0.50)
                 .alias("rush_share_pred"),
             )
-        )
-    else:
-        # Escape hatch for breakout's own role-prior lookup. Emit zero
-        # adjustment columns so downstream schema is stable.
-        target = target.with_columns(
-            pl.lit(0.0).alias("breakout_adjustment_ts"),
-            pl.lit(0.0).alias("breakout_adjustment_rs"),
         )
 
     target = target.sort(
