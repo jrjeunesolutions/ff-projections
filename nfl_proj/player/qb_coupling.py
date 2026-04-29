@@ -1,3 +1,4 @@
+# Contract: see docs/projection_contract.md
 """
 Phase 8c Part 2 — QB-environment coupling feature builder (Commit A).
 
@@ -45,13 +46,25 @@ Architecture notes:
 
 from __future__ import annotations
 
+import logging
+import re
 from dataclasses import dataclass
+from pathlib import Path
 
 import polars as pl
 
 from nfl_proj.backtest.pipeline import BacktestContext
+from nfl_proj.data.team_assignment import team_assignments_as_of
 from nfl_proj.player.qb import QBProjection, project_qb
 from nfl_proj.rookies.models import RookieProjection, project_rookies
+
+log = logging.getLogger(__name__)
+
+
+# Path to the curated Week-1 starter CSV, authored 2026-04 (see header
+# of `data/external/qb_depth_charts.csv` for the source URLs).
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_QB_DEPTH_CSV = _REPO_ROOT / "data" / "external" / "qb_depth_charts.csv"
 
 
 # ---------------------------------------------------------------------------
@@ -65,30 +78,44 @@ from nfl_proj.rookies.models import RookieProjection, project_rookies
 SEASON_GAMES: int = 17
 
 
-# Draft-side → game-week team-code normalization.
+# Draft-side → game-week team-code normalization fallback.
+#
+# ``team_assignments_as_of`` is the primary source of truth for every
+# QB's team (see ``_project_starters``). For 2024 that resolver returns
+# canonical nflverse codes for every QB and correctly catches roster
+# moves that draft-picks would miss (e.g. Michael Pratt GB→TB between
+# draft-day and the Aug 15 snapshot). This dict is retained as a
+# defensive fallback: if the resolver ever returns null for a player
+# (e.g. a new rookie with no annual roster row yet), we coalesce to
+# the ``qb_proj.qbs`` team column and apply this mapping to catch the
+# draft-side abbreviations (NWE/NOR/GNB/KAN/LVR/SFO/TAM) so they don't
+# leak into the per-team group_bys.
 #
 # TODO(upstream): The real fix belongs in
 # ``project_qb._project_rookie_qbs`` — ``loaders.load_draft_picks`` emits
-# PFR-style draft abbreviations (NWE/NOR/GNB/KAN/LVR/SFO/TAM) while the
-# veteran path in ``project_qb`` emits nflverse game-week codes
-# (NE/NO/GB/KC/LV/SF/TB). Normalising on the rookie-loader side would let
-# this module stop carrying a boundary-layer workaround. Doing it here
-# for Commit A so the smoke test yields a clean 32-team frame without
-# touching project_qb.
+# the PFR-style abbreviations above, so every rookie row from that
+# function starts with a non-canonical team code. If ``project_qb`` is
+# updated to resolve rookie teams via ``team_assignments_as_of``
+# directly, this fallback mapping becomes fully unused and can be
+# deleted from this module.
 #
 # TODO(phase8c-part2 followup): project_qb._project_rookie_qbs also
 # collapses all rookie QBs to a single round-bucket mean, discarding the
-# prospect_tier signal that project_rookies already computes (same upstream
-# file as the team-code fix above — both defects should be addressed
-# together). This module routes rookie-QB teams to project_rookies as a
-# workaround so the prospect_tier signal is recoverable, but intentionally
-# does NOT patch the inflated rookie pass_attempts_pred at the
-# starter-selection step. A prior vet-share-floor heuristic was tried and
-# removed (3-of-6 2024 named-case failures on out-of-sample; see
-# ``reports/investigations/`` and git history). The correct fix is upstream
-# in project_qb; until then the rookie argmax will sometimes outrank a
-# real Week-1 vet, and Commit B's validation is the right place to decide
-# whether to pause and fix upstream or train on contaminated features.
+# prospect_tier signal that project_rookies already computes (same
+# upstream file as the team-code fix above — both defects should be
+# addressed together). This module routes rookie-QB teams to
+# project_rookies as a workaround so the prospect_tier signal is
+# recoverable, but intentionally does NOT patch the inflated rookie
+# pass_attempts_pred at the starter-selection step. The
+# declared-vet-preference rule above handles the common case where a
+# signed vet outranks the tier-collapsed rookie bucket; the residual
+# argmax fallback still leaks the inflated rookie attempts on teams
+# with no qualifying vet. A prior vet-share-floor heuristic was tried
+# and removed (3-of-6 2024 named-case failures on out-of-sample; see
+# ``reports/investigations/`` and git history). The correct fix is
+# upstream in project_qb; until then Commit B's validation is the
+# right place to decide whether to pause and fix upstream or train on
+# contaminated features.
 TEAM_CODE_NORMALIZATION: dict[str, str] = {
     "NWE": "NE",
     "NOR": "NO",
@@ -118,12 +145,11 @@ class QbCouplingFeatures:
             is_rookie_starter,  rookie_prospect_tier,
             rookie_round,       rookie_pick,
             proj_ypa,           proj_pass_atts_pg,
-            team_proj_ypa,      team_proj_pass_atts_pg
+            team_proj_ypa,      team_proj_pass_atts_pg,
+            starter_source
 
-        For veteran starters, ``rookie_prospect_tier / round / pick`` are
-        null and ``is_rookie_starter`` is False. For rookie starters,
-        those four fields come from ``project_rookies`` and
-        ``is_rookie_starter`` is True.
+        ``starter_source`` is one of ``csv | vet_fallback |
+        argmax_fallback`` — see ``_project_starters``.
 
     ``historical``:
         One row per (team, historical_season) observed in
@@ -133,19 +159,30 @@ class QbCouplingFeatures:
             primary_ypa, primary_pass_atts_pg,
             team_ypa,    team_pass_atts_pg
 
-        Downstream joins the prior year's row (season = target - 1) to
-        compute ypa / pass_atts_pg deltas.
+    ``team_deltas``:
+        One row per team in ``target_season``. Columns:
+            team, target_season,
+            projected_starter_id,  projected_starter_name,
+            prior_starter_id,      prior_starter_name,
+            proj_ypa, proj_pass_atts_pg,
+            prior_ypa, prior_pass_atts_pg,
+            ypa_delta, pass_atts_pg_delta,
+            qb_change_flag
+
+        ``qb_change_flag`` = ``projected_starter_id !=
+        prior_starter_id``. ``prior_starter_id`` comes from the
+        historical[Y-1] primary QB (``_team_qb_history``); the CSV
+        Y-1 row is preferred when it agrees, but the historical
+        primary is the authoritative numerical source for ``prior_*``
+        rate columns.
 
     ``rookie_starter_teams``:
         Subset of ``projected`` filtered to ``is_rookie_starter = True``.
-        Separate frame so Commit B / Commit D reports can audit the
-        rookie-QB routing without re-filtering. These are the teams that
-        exercise the ``project_qb._project_rookie_qbs`` workaround
-        (see TODO in module docstring).
     """
 
     projected: pl.DataFrame
     historical: pl.DataFrame
+    team_deltas: pl.DataFrame
     rookie_starter_teams: pl.DataFrame
 
 
@@ -254,42 +291,120 @@ def _team_qb_history(player_stats_week: pl.DataFrame) -> pl.DataFrame:
 # ---------------------------------------------------------------------------
 
 
+def _prior_season_qb_attempts(
+    player_stats_week: pl.DataFrame, prior_season: int
+) -> pl.DataFrame:
+    """
+    Per-player REG-season pass attempts for ``prior_season``, summed
+    across any teams the player appeared on. Used to gate the
+    declared-vet-preference rule in ``_project_starters``.
+    """
+    return (
+        player_stats_week.filter(
+            (pl.col("position") == "QB")
+            & (pl.col("season_type") == "REG")
+            & (pl.col("season") == prior_season)
+        )
+        .group_by("player_id")
+        .agg(pl.col("attempts").sum().alias("prior_pass_attempts"))
+    )
+
+
+def _normalize_name(s: str | None) -> str:
+    """Lowercase + strip non-alphanumerics (matches research tracker)."""
+    if s is None:
+        return ""
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def _load_depth_chart_starters(target_season: int) -> pl.DataFrame:
+    """
+    Load `data/external/qb_depth_charts.csv` and return one row per
+    team for ``target_season`` with curated Week-1 starter name +
+    confidence flag (low for rows whose ``note`` starts with
+    ``VERIFY:``). Returns an empty frame if the season is not present.
+    """
+    if not _QB_DEPTH_CSV.exists():
+        log.warning("qb_depth_charts.csv not found at %s", _QB_DEPTH_CSV)
+        return pl.DataFrame(
+            schema={
+                "team": pl.Utf8,
+                "csv_player_name": pl.Utf8,
+                "csv_norm_name": pl.Utf8,
+                "csv_low_confidence": pl.Boolean,
+                "csv_note": pl.Utf8,
+            }
+        )
+    df = pl.read_csv(_QB_DEPTH_CSV)
+    out = (
+        df.filter(
+            (pl.col("season") == target_season) & (pl.col("depth_order") == 1)
+        )
+        .with_columns(
+            pl.col("note").fill_null("").alias("csv_note"),
+        )
+        .with_columns(
+            pl.col("csv_note").str.starts_with("VERIFY:").alias(
+                "csv_low_confidence"
+            ),
+        )
+        .select(
+            "team",
+            pl.col("player_name").alias("csv_player_name"),
+            "csv_low_confidence",
+            "csv_note",
+        )
+    )
+    out = out.with_columns(
+        pl.col("csv_player_name")
+        .map_elements(_normalize_name, return_dtype=pl.Utf8)
+        .alias("csv_norm_name"),
+    )
+    return out
+
+
 def _project_starters(
     qb_proj: QBProjection,
     rookie_proj: RookieProjection,
+    *,
     target_season: int,
+    as_of_date,
+    player_stats_week: pl.DataFrame,
 ) -> pl.DataFrame:
     """
-    Build the per-team projected-starter frame for ``target_season``.
+    Build the per-team projected-starter frame for ``target_season``
+    using a curated-CSV-driven picker.
 
-    Starter per team = QB with highest ``pass_attempts_pred``. No
-    vet-override heuristic is applied at this boundary — an earlier
-    vet-share floor was tried and removed (see the
-    ``TODO(phase8c-part2 followup)`` block above for the history).
-    When the argmax picks a rookie because the upstream
-    ``project_qb._project_rookie_qbs`` tier-collapse inflates rookie
-    ``pass_attempts_pred``, that is a known upstream defect that bleeds
-    through to this frame untreated.
+    Picker rule (per team)
+    ----------------------
+      1. Look up the team's row in
+         ``data/external/qb_depth_charts.csv`` filtered to
+         ``season == target_season`` and ``depth_order == 1``. If a
+         match is found in the team's QB pool (``qb_proj.qbs`` for that
+         team, joined on case-insensitive normalized
+         ``player_display_name``), select that QB. Source label =
+         ``csv``. Rows whose CSV ``note`` begins with ``VERIFY:`` are
+         logged as low-confidence but not failed.
+      2. Otherwise — argmax of prior-season REG pass attempts among the
+         non-rookie QBs on the team. Source label = ``vet_fallback``.
+         Picks up cases where the CSV name doesn't normalize-match
+         (rare).
+      3. Otherwise — argmax of ``pass_attempts_pred`` over all QBs on
+         the team. Source label = ``argmax_fallback``. Used when there
+         is no CSV match and no non-rookie QB (e.g. a hypothetical
+         all-rookie depth chart, or a season not yet in the CSV).
 
-    Team aggregates (``team_proj_ypa``, ``team_proj_pass_atts_pg``) sum
-    across every QB ``project_qb`` emitted for the team.
+    The picker no longer uses an attempts threshold — the CSV is the
+    authority. ESPN/MCP depth charts are live-only and have no
+    historical dimension, so they cannot validate 2024-style backtests;
+    the CSV is the only source that gives us per-season Week-1
+    starters.
 
-    Rookie-starter handling: the per-QB output from ``project_qb``
-    includes rookie QBs but with the *tier-collapsed* round-bucket mean
-    (see ``TEAM_CODE_NORMALIZATION`` TODOs above). We therefore left-join
-    ``project_rookies.projections`` on player_id to attach
-    ``prospect_tier / round / pick`` for teams whose projected starter
-    is a rookie, so Commit B has the differentiating signal available.
+    Team resolution and team aggregates work as before — see prior
+    versions of this docstring (see git history for full prose).
 
-    The ``_is_rookie`` per-row tag (set-membership against
-    ``rookie_proj.projections`` filtered to position=QB) is computed on
-    the per-QB frame but not currently referenced by starter selection
-    (argmax-only) or the team-level aggregate. It's retained because
-    ``is_rookie_starter`` on the output frame is derived from a separate
-    join against ``rookie_proj`` (line-level prospect_tier attach), and
-    keeping the row-level tag here makes this module's rookie/vet split
-    inspectable and reusable for Commit B diagnostics without
-    re-joining.
+    Rookie-tier attach: ``project_rookies.projections`` is left-joined
+    on player_id; ``is_rookie_starter`` is derived from that join.
     """
     qbs = qb_proj.qbs
     empty_schema = {
@@ -305,33 +420,56 @@ def _project_starters(
         "proj_pass_atts_pg": pl.Float64,
         "team_proj_ypa": pl.Float64,
         "team_proj_pass_atts_pg": pl.Float64,
+        "starter_source": pl.Utf8,
     }
     if qbs.height == 0:
         return pl.DataFrame(schema=empty_schema)
 
-    # Normalise draft-side team codes to game-week codes BEFORE any
-    # per-team grouping, so NE+NWE, NO+NOR, GB+GNB etc. collapse to
-    # single team rows. See TODO block by TEAM_CODE_NORMALIZATION.
-    qbs = qbs.with_columns(
-        pl.col("team").replace(TEAM_CODE_NORMALIZATION).alias("team"),
+    # ------------------------------------------------------------------
+    # Step 1 — canonical per-QB team via team_assignments_as_of, with
+    # TEAM_CODE_NORMALIZATION as a defensive fallback.
+    # ------------------------------------------------------------------
+    ids = qbs["player_id"].unique().drop_nulls().to_list()
+    resolved = team_assignments_as_of(ids, as_of_date).select(
+        "player_id", pl.col("team").alias("_resolved_team")
+    )
+    qbs = (
+        qbs.join(resolved, on="player_id", how="left")
+        .with_columns(
+            pl.coalesce(
+                pl.col("_resolved_team"),
+                pl.col("team").replace(TEAM_CODE_NORMALIZATION),
+            ).alias("team"),
+        )
+        .drop("_resolved_team")
     )
 
-    # Tag each QB row as rookie/vet using membership in the rookie-model
-    # output. ``project_qb.qbs`` does not carry an is_rookie flag, but
-    # ``project_rookies.projections`` only contains drafted rookies, so
-    # set membership is the reliable signal.
+    # ------------------------------------------------------------------
+    # Step 2 — per-QB prior-season REG attempts + rookie flag (used by
+    # vet_fallback when CSV miss).
+    # ------------------------------------------------------------------
+    prior_atts = _prior_season_qb_attempts(player_stats_week, target_season - 1)
     rookie_qb_ids = (
         rookie_proj.projections.filter(pl.col("position") == "QB")
         .select("player_id")
         .unique()["player_id"]
         .to_list()
     )
-    qbs = qbs.with_columns(
-        pl.col("player_id").is_in(rookie_qb_ids).alias("_is_rookie"),
+    qbs = (
+        qbs.join(prior_atts, on="player_id", how="left")
+        .with_columns(
+            pl.col("prior_pass_attempts").fill_null(0).cast(pl.Int64),
+            pl.col("player_id").is_in(rookie_qb_ids).alias("_is_rookie"),
+            pl.col("player_display_name")
+            .map_elements(_normalize_name, return_dtype=pl.Utf8)
+            .alias("_norm_name"),
+        )
     )
 
-    # Team-level projection aggregate (all QBs on the team, not just
-    # starter) -- captures dilution by backups.
+    # ------------------------------------------------------------------
+    # Step 3 — team-level projection aggregate (independent of starter
+    # selection).
+    # ------------------------------------------------------------------
     team_agg = (
         qbs.group_by("team")
         .agg(
@@ -342,20 +480,112 @@ def _project_starters(
             (pl.col("_team_yds") / pl.col("_team_att").clip(1)).alias(
                 "team_proj_ypa"
             ),
-            # Projected team pass_atts_pg denominator = SEASON_GAMES (17).
-            # Historical frame uses observed per-(team, season) game count,
-            # which is the correct pre-2021 vs 2021+ distinction. For the
-            # future season we assume full 17.
             (pl.col("_team_att") / SEASON_GAMES).alias("team_proj_pass_atts_pg"),
         )
         .select("team", "team_proj_ypa", "team_proj_pass_atts_pg")
     )
 
-    # Starter per team = argmax over pass_attempts_pred. No vet override.
-    starter = (
+    # ------------------------------------------------------------------
+    # Step 4 — CSV-driven starter pick.
+    # ------------------------------------------------------------------
+    csv_chart = _load_depth_chart_starters(target_season)
+    csv_pick = (
+        qbs.join(
+            csv_chart,
+            left_on=["team", "_norm_name"],
+            right_on=["team", "csv_norm_name"],
+            how="inner",
+        )
+        # In the rare case multiple QBs match (shouldn't happen — names
+        # are normalized and unique), break ties by pass_attempts_pred.
+        .sort("pass_attempts_pred", descending=True, nulls_last=True)
+        .group_by("team", maintain_order=True)
+        .first()
+        .select(
+            "team",
+            pl.col("player_id").alias("_csv_pid"),
+            pl.col("player_display_name").alias("_csv_name"),
+            pl.col("pass_attempts_pred").alias("_csv_att_pred"),
+            pl.col("pass_yards_pred").alias("_csv_yds_pred"),
+            pl.col("games_pred").alias("_csv_games_pred"),
+            "csv_low_confidence",
+            "csv_note",
+            pl.col("csv_player_name").alias("_csv_player_name_in_csv"),
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Step 5 — vet-fallback (argmax prior_pass_attempts among non-rookies)
+    # for teams the CSV didn't resolve.
+    # ------------------------------------------------------------------
+    vet_fb = (
+        qbs.filter(~pl.col("_is_rookie") & (pl.col("prior_pass_attempts") > 0))
+        .sort("prior_pass_attempts", descending=True, nulls_last=True)
+        .group_by("team", maintain_order=True)
+        .first()
+        .select(
+            "team",
+            pl.col("player_id").alias("_vet_pid"),
+            pl.col("player_display_name").alias("_vet_name"),
+            pl.col("pass_attempts_pred").alias("_vet_att_pred"),
+            pl.col("pass_yards_pred").alias("_vet_yds_pred"),
+            pl.col("games_pred").alias("_vet_games_pred"),
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Step 6 — argmax-fallback over all QBs (last resort).
+    # ------------------------------------------------------------------
+    argmax_fb = (
         qbs.sort("pass_attempts_pred", descending=True, nulls_last=True)
         .group_by("team", maintain_order=True)
         .first()
+        .select(
+            "team",
+            pl.col("player_id").alias("_amx_pid"),
+            pl.col("player_display_name").alias("_amx_name"),
+            pl.col("pass_attempts_pred").alias("_amx_att_pred"),
+            pl.col("pass_yards_pred").alias("_amx_yds_pred"),
+            pl.col("games_pred").alias("_amx_games_pred"),
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Step 7 — combine in CSV → vet → argmax priority. Tag source.
+    # ------------------------------------------------------------------
+    starter = (
+        argmax_fb
+        .join(vet_fb, on="team", how="left")
+        .join(csv_pick, on="team", how="left")
+        .with_columns(
+            pl.coalesce(
+                pl.col("_csv_pid"), pl.col("_vet_pid"), pl.col("_amx_pid")
+            ).alias("player_id"),
+            pl.coalesce(
+                pl.col("_csv_name"), pl.col("_vet_name"), pl.col("_amx_name")
+            ).alias("player_display_name"),
+            pl.coalesce(
+                pl.col("_csv_att_pred"),
+                pl.col("_vet_att_pred"),
+                pl.col("_amx_att_pred"),
+            ).alias("pass_attempts_pred"),
+            pl.coalesce(
+                pl.col("_csv_yds_pred"),
+                pl.col("_vet_yds_pred"),
+                pl.col("_amx_yds_pred"),
+            ).alias("pass_yards_pred"),
+            pl.coalesce(
+                pl.col("_csv_games_pred"),
+                pl.col("_vet_games_pred"),
+                pl.col("_amx_games_pred"),
+            ).alias("games_pred"),
+            pl.when(pl.col("_csv_pid").is_not_null())
+            .then(pl.lit("csv"))
+            .when(pl.col("_vet_pid").is_not_null())
+            .then(pl.lit("vet_fallback"))
+            .otherwise(pl.lit("argmax_fallback"))
+            .alias("starter_source"),
+        )
         .join(team_agg, on="team", how="left")
         .with_columns(
             (
@@ -370,9 +600,27 @@ def _project_starters(
         )
     )
 
-    # Attach prospect_tier for rookie starters from project_rookies.
-    # Filtering to position=QB is defensive: project_rookies emits
-    # RB/WR/TE rows too, and we don't want them accidentally joining.
+    # ------------------------------------------------------------------
+    # Logging — print every team's pick + source, and any low-confidence
+    # CSV rows.
+    # ------------------------------------------------------------------
+    for row in starter.sort("team").iter_rows(named=True):
+        team = row["team"]
+        name = row["player_display_name"]
+        src = row["starter_source"]
+        low = row.get("csv_low_confidence")
+        note = row.get("csv_note") or ""
+        if src == "csv" and low:
+            log.info(
+                "qb_coupling picker: %s -> %s (source=csv, LOW-CONFIDENCE: %s)",
+                team, name, note,
+            )
+        else:
+            log.info("qb_coupling picker: %s -> %s (source=%s)", team, name, src)
+
+    # ------------------------------------------------------------------
+    # Step 8 — attach rookie prospect_tier.
+    # ------------------------------------------------------------------
     rookie_tier = (
         rookie_proj.projections.filter(pl.col("position") == "QB")
         .select(
@@ -400,6 +648,87 @@ def _project_starters(
         "proj_pass_atts_pg",
         "team_proj_ypa",
         "team_proj_pass_atts_pg",
+        "starter_source",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Team-level delta frame
+# ---------------------------------------------------------------------------
+
+
+def _build_team_deltas(
+    projected: pl.DataFrame,
+    historical: pl.DataFrame,
+    target_season: int,
+) -> pl.DataFrame:
+    """
+    Per-team Y-vs-(Y-1) delta frame.
+
+    For each team in ``projected`` (target_season = Y), join the prior
+    season's primary-QB row from ``historical`` (season = Y-1) and
+    compute:
+
+      * ``ypa_delta = proj_ypa - prior_ypa``
+      * ``pass_atts_pg_delta = proj_pass_atts_pg - prior_pass_atts_pg``
+      * ``qb_change_flag = projected_starter_id != prior_starter_id``
+
+    ``prior_starter_id`` / ``prior_starter_name`` come from
+    ``historical[Y-1]`` directly (the primary QB by attempts that
+    season). The CSV's Y-1 row was already used implicitly via the
+    historical primary computation, so the two agree by construction
+    in well-behaved cases. Where the CSV says "Week-1 starter" but the
+    historical primary is a different QB (e.g. 2023 NYJ: CSV =
+    Aaron Rodgers, historical primary = Zach Wilson because Rodgers
+    played 4 plays before tearing his Achilles), the historical
+    primary wins for the rate columns — that is the correct numerical
+    representation of the team's QB environment that season, even if
+    the "intended Week-1 starter" was someone else.
+
+    Returns one row per team with no nulls in the rate columns when
+    ``historical`` covers Y-1 for that team.
+    """
+    prior = historical.filter(pl.col("season") == target_season - 1).select(
+        "team",
+        pl.col("primary_qb_id").alias("prior_starter_id"),
+        pl.col("primary_qb_name").alias("prior_starter_name"),
+        pl.col("primary_ypa").alias("prior_ypa"),
+        pl.col("primary_pass_atts_pg").alias("prior_pass_atts_pg"),
+    )
+    return (
+        projected.select(
+            "team",
+            "target_season",
+            "projected_starter_id",
+            "projected_starter_name",
+            "proj_ypa",
+            "proj_pass_atts_pg",
+        )
+        .join(prior, on="team", how="left")
+        .with_columns(
+            (pl.col("proj_ypa") - pl.col("prior_ypa")).alias("ypa_delta"),
+            (
+                pl.col("proj_pass_atts_pg") - pl.col("prior_pass_atts_pg")
+            ).alias("pass_atts_pg_delta"),
+            (
+                pl.col("projected_starter_id") != pl.col("prior_starter_id")
+            ).alias("qb_change_flag"),
+        )
+        .select(
+            "team",
+            "target_season",
+            "projected_starter_id",
+            "projected_starter_name",
+            "prior_starter_id",
+            "prior_starter_name",
+            "proj_ypa",
+            "proj_pass_atts_pg",
+            "prior_ypa",
+            "prior_pass_atts_pg",
+            "ypa_delta",
+            "pass_atts_pg_delta",
+            "qb_change_flag",
+        )
     )
 
 
@@ -450,12 +779,22 @@ def build_qb_quality_frame(
     )
 
     historical = _team_qb_history(ctx.player_stats_week)
-    projected = _project_starters(qb_proj, rookie_proj, ctx.target_season)
+    projected = _project_starters(
+        qb_proj,
+        rookie_proj,
+        target_season=ctx.target_season,
+        as_of_date=ctx.as_of_date,
+        player_stats_week=ctx.player_stats_week,
+    )
 
+    team_deltas = _build_team_deltas(
+        projected, historical, target_season=ctx.target_season
+    )
     rookie_starter_teams = projected.filter(pl.col("is_rookie_starter"))
 
     return QbCouplingFeatures(
         projected=projected,
         historical=historical,
+        team_deltas=team_deltas,
         rookie_starter_teams=rookie_starter_teams,
     )

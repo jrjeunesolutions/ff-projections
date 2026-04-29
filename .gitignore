@@ -31,8 +31,8 @@ data/processed/
 # Notebooks
 .ipynb_checkpoints/
 
-# Claude Code local settings
-.claude/settings.local.json
+# Claude Code local settings + scheduled-task locks
+.claude/
 
 # Env files (safety guard — none currently present)
 .env

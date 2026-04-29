@@ -118,8 +118,39 @@ def main() -> None:
     print("  - ATL: Ridder/Heinicke → Cousins (same-team, vet starter)")
     print("  - CHI: Fields → Caleb Williams (rookie starter, tier=elite)")
     print("  - WAS: Howell → Jayden Daniels (rookie starter, tier=elite)")
-    print("  - NE:  Mac Jones → Drake Maye (rookie starter, tier=high)")
+    print("  - NE:  Mac Jones → Brissett (CSV-driven W1 starter)")
     print("  - DEN: Wilson → Bo Nix (rookie starter, tier=mid)")
+
+    # ----------------------------------------------------------------------
+    # (5) Team-deltas frame — focuses the 5 named 2024 misses' teams:
+    #     Jefferson (MIN), Taylor (IND), Bijan (ATL), London (ATL), Dowdle (DAL)
+    # ----------------------------------------------------------------------
+    print("\n(5) Team-deltas frame for the 5 named 2024 misses' teams")
+    print("-" * 72)
+    miss_teams = ["MIN", "IND", "ATL", "DAL"]
+    td = (
+        feats.team_deltas
+        .filter(pl.col("team").is_in(miss_teams))
+        .sort("team")
+    )
+    print(td.select(
+        "team",
+        pl.col("prior_starter_name").alias("prior_qb"),
+        pl.col("projected_starter_name").alias("proj_qb"),
+        "qb_change_flag",
+        pl.col("prior_ypa").round(3),
+        pl.col("proj_ypa").round(3),
+        pl.col("ypa_delta").round(3),
+        pl.col("prior_pass_atts_pg").round(2),
+        pl.col("proj_pass_atts_pg").round(2),
+        pl.col("pass_atts_pg_delta").round(2),
+    ))
+    print("\nNamed 2024 misses (player → team in 2024):")
+    print("  - Justin Jefferson  (MIN): Cousins → Darnold")
+    print("  - Jonathan Taylor   (IND): Minshew → Richardson")
+    print("  - Bijan Robinson    (ATL): Ridder  → Cousins")
+    print("  - Drake London      (ATL): Ridder  → Cousins")
+    print("  - Rico Dowdle       (DAL): Prescott→ Prescott (no QB change)")
 
 
 if __name__ == "__main__":

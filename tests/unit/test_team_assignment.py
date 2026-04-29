@@ -114,10 +114,15 @@ class TestBatch:
             single = get_player_team_as_of(pid, date(2024, 8, 15))
             assert got[pid] == single
 
-    def test_source_accounting_is_annual_for_preseason(self):
+    def test_source_accounting_is_preseason_weekly_for_preseason(self):
         batch = team_assignments_as_of([SAQUON, HENRY], date(2024, 8, 15))
-        # Preseason: weekly has no current-year rows → source should be annual.
-        assert set(batch["source"].to_list()) == {"annual"}
+        # Preseason (Aug 15 is before Week 1): the resolver prefers the
+        # season's earliest weekly roster row over the season-end annual.
+        # See team_assignment.py source 2b — this is the fix for the
+        # Daniel-Jones-on-MIN-at-2024-08-15 bug, where the season-end
+        # annual reflects post-cut transactions and is wrong for
+        # preseason snapshots.
+        assert set(batch["source"].to_list()) == {"preseason_weekly"}
 
 
 class TestManualOverride(object):

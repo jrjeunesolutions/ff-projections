@@ -241,8 +241,43 @@ def get_player_team_as_of(
     if hit.height > 0:
         return _normalise_team(hit["team"][0])
 
+    # 2b. Preseason fallback — weekly rosters published BEFORE Week 1.
+    #
+    # The annual nflverse roster is a season-end snapshot: any in-season
+    # transaction (e.g. Daniel Jones cut by NYG and signing with MIN's
+    # practice squad in Nov 2024) overwrites the player's `team` value.
+    # That makes the annual a bad point-in-time source for preseason
+    # snapshots like as_of=2024-08-15.
+    #
+    # The weekly rosters frame, by contrast, has one row per (player,
+    # week) reflecting the team the player was on at the time that
+    # week's game was played. For preseason as_of dates, the EARLIEST
+    # weekly row of the rosters-year is the closest available record
+    # of the Week-1 active roster. We surface that here, ahead of the
+    # season-end annual fallback below.
+    #
+    # Semantics ported from
+    # `studies/player_career_tracker.py` in the research workspace:
+    # that tracker uses observed stats/weekly-rosters as authoritative
+    # for team attribution, with mid-season trades naturally captured
+    # by week-by-week team changes. The same principle applies here —
+    # week-1 weekly is more accurate than season-end annual for
+    # preseason team attribution.
+    preseason = (
+        weekly.filter(
+            (pl.col("player_id") == player_id)
+            & (pl.col("season") == year)
+        )
+        .sort("week_date")
+        .head(1)
+    )
+    if preseason.height > 0:
+        return _normalise_team(preseason["team"][0])
+
     # 3. Annual roster for the current rosters-year (captures offseason
-    # moves once nflverse publishes the season's roster).
+    # moves once nflverse publishes the season's roster). For dates
+    # *after* Week 1 the weekly path above already wins; this remains
+    # the fallback for players with no weekly row at all.
     annual = _rosters_all()
     hit = (
         annual.filter(
@@ -317,13 +352,29 @@ def team_assignments_as_of(
 
     # Source 2 — weekly, current rosters-year only (see lookup()).
     year = rosters_year_for(d)
+    weekly_all_year = _rosters_weekly_all().filter(pl.col("season") == year)
     weekly_hits = (
-        _rosters_weekly_all()
-        .filter((pl.col("week_date") <= d) & (pl.col("season") == year))
+        weekly_all_year
+        .filter(pl.col("week_date") <= d)
         .sort("week_date", descending=True)
         .group_by("player_id", maintain_order=True)
         .first()
         .select("player_id", pl.col("team").alias("weekly_team"))
+    )
+
+    # Source 2b — preseason weekly fallback. See ``get_player_team_as_of``
+    # for the rationale: when ``as_of`` precedes Week 1, the season's
+    # earliest weekly row (typically Week 1 itself) is a more accurate
+    # point-in-time source than the season-end annual. This is the fix
+    # for the Daniel-Jones-on-MIN-at-2024-08-15 bug — Jones's annual
+    # 2024 row resolves to MIN (his end-of-season practice-squad team)
+    # but his Week-1 weekly row correctly resolves to NYG.
+    preseason_weekly_hits = (
+        weekly_all_year
+        .sort("week_date")
+        .group_by("player_id", maintain_order=True)
+        .first()
+        .select("player_id", pl.col("team").alias("preseason_weekly_team"))
     )
 
     # Source 3 — annual, current rosters-year
@@ -348,22 +399,29 @@ def team_assignments_as_of(
         id_frame
         .join(manual_hits, on="player_id", how="left")
         .join(weekly_hits, on="player_id", how="left")
+        .join(preseason_weekly_hits, on="player_id", how="left")
         .join(annual_hits, on="player_id", how="left")
         .join(prior_hits, on="player_id", how="left")
     )
 
-    # Pick first non-null per priority.
+    # Pick first non-null per priority. ``preseason_weekly`` slots
+    # between same-season weekly-as-of and the season-end annual:
+    # weekly-as-of catches in-season dates; preseason_weekly catches
+    # August/early-September dates by reading Week 1's roster snapshot;
+    # annual is the season-end fallback for players with no weekly row.
     out = joined.with_columns(
         pl.coalesce(
             [
                 pl.col("manual_team"),
                 pl.col("weekly_team"),
+                pl.col("preseason_weekly_team"),
                 pl.col("annual_team"),
                 pl.col("prior_annual_team"),
             ]
         ).alias("team_raw"),
         pl.when(pl.col("manual_team").is_not_null()).then(pl.lit("manual"))
         .when(pl.col("weekly_team").is_not_null()).then(pl.lit("weekly"))
+        .when(pl.col("preseason_weekly_team").is_not_null()).then(pl.lit("preseason_weekly"))
         .when(pl.col("annual_team").is_not_null()).then(pl.lit("annual"))
         .when(pl.col("prior_annual_team").is_not_null()).then(pl.lit("prior_annual"))
         .otherwise(pl.lit("missing"))

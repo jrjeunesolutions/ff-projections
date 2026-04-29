@@ -1,3 +1,4 @@
+# Contract: see docs/projection_contract.md
 """
 Phase 5: per-player efficiency projections with empirical Bayes shrinkage.
 
