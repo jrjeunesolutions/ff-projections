@@ -1,8 +1,9 @@
-# Per-Player Season Projection Contract — v1
+# Per-Player Season Projection Contract — v1.1
 
 **Owner**: ffootball-projections
 **Consumers**: ffootball-research (Veteran Dynasty Value Model)
-**Status**: v1 draft — frozen for parallel work on Phase 8c Part 2 + Veteran Value Model
+**Status**: v1.1 — additive bump for Phase 8c Part 2 Commit C
+(`qb_coupling_adjustment_ppr_pg`). v1 consumers remain compatible.
 
 This is the canonical interface between the projection stack and downstream
 dynasty/research consumers. Both sides code against this schema. Any field
@@ -44,6 +45,7 @@ One row per (`player_id`, `season`). Polars DataFrame, written to parquet.
 | `ypa_delta` | f64 \| null | Incoming.proj_ypa − outgoing.primary_ypa. Null if `qb_change_flag` is False. |
 | `pass_atts_pg_delta` | f64 \| null | Incoming.proj_pass_atts_pg − outgoing.primary_pass_atts_pg. Null if `qb_change_flag` is False. |
 | `is_rookie` | bool | True if rookie season. |
+| `qb_coupling_adjustment_ppr_pg` | f64 | **v1.1**. Phase 8c Part 2 Commit C residual Ridge adjustment in PPR points/game. 0.0 when `apply_qb_coupling=False` (default), or when the player is outside the cohort (QBs, RBs with `prior_max_targets_2y < 20`, or any player with no team-level QB-environment delta). When applied, the season-level contribution is `qb_coupling_adjustment_ppr_pg × proj_games`. |
 
 ## Identity rules
 
@@ -55,9 +57,10 @@ One row per (`player_id`, `season`). Polars DataFrame, written to parquet.
 
 ## Versioning
 
-- This is **v1**. Additions are non-breaking; renames or type changes bump to v2.
-- Producer writes a `_meta.json` sidecar with `{schema_version: "v1", generated_at: ..., as_of_date: ...}`.
-- Consumer asserts `schema_version == "v1"` on load.
+- This is **v1.1**. Additions are non-breaking; renames or type changes bump to v2.
+- v1.1 vs v1: added `qb_coupling_adjustment_ppr_pg` (Phase 8c Part 2 Commit C, default 0.0). v1 consumers remain compatible — they can ignore the new column.
+- Producer writes a `_meta.json` sidecar with `{schema_version: "v1.1", generated_at: ..., as_of_date: ...}`.
+- Consumer asserts `schema_version` is in `{"v1", "v1.1"}` on load (forward-compatible).
 
 ## Drop location
 

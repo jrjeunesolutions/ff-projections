@@ -509,10 +509,27 @@ def project_fantasy_points(
     availability: AvailabilityProjection | None = None,
     rookies: RookieProjection | None = None,
     qb: QBProjection | None = None,
+    apply_qb_coupling: bool = False,
 ) -> ScoringProjection:
     """
     Run every upstream projection (or reuse passed-in results) and fold
     into per-player PPR fantasy points + in-position ranks.
+
+    Parameters
+    ----------
+    apply_qb_coupling : bool, default False
+        Phase 8c Part 2 Commit C integration flag. When True, applies
+        the per-player QB-environment-coupling adjustment from
+        :func:`nfl_proj.player.qb_coupling_ridge.project_qb_coupling_adjustment`
+        as an additive delta to ``fantasy_points_pred`` (multiplied by
+        ``games_pred`` to convert per-game → season). Default is False
+        per the Phase 8c Part 1 postmortem precedent: integration ships
+        default-off until the falsifiable validation gate (Commit D)
+        passes — see ``reports/phase8c_part2_session_state.md`` §7.9.
+
+        Players outside the cohort (QBs, low-target RBs, players whose
+        team had no QB-environment delta) get adjustment=0 via the
+        left-join.
     """
     team = team or project_team_season(ctx)
     gamescript = gamescript or project_gamescript(ctx, team_result=team)
@@ -560,6 +577,43 @@ def project_fantasy_points(
     combined = combined.join(baseline, on="player_id", how="left")
 
     scored = _apply_ppr(combined)
+
+    # Phase 8c Part 2 Commit C — QB-coupling adjustment, default-off.
+    # Adds the per-player residual-Ridge adjustment (PPR/game) × games_pred
+    # to fantasy_points_pred. Players outside the cohort or with no
+    # adjustment row → 0 via left-join + fill_null. Local import avoids a
+    # circular dependency (qb_coupling_ridge calls project_fantasy_points
+    # inside its baseline helper).
+    if apply_qb_coupling:
+        from nfl_proj.player.qb_coupling_ridge import (
+            project_qb_coupling_adjustment,
+        )
+
+        adj = project_qb_coupling_adjustment(ctx)
+        scored = scored.join(
+            adj.adjustments.select(
+                "player_id", "qb_coupling_adjustment_ppr_pg"
+            ),
+            on="player_id",
+            how="left",
+        ).with_columns(
+            pl.col("qb_coupling_adjustment_ppr_pg").fill_null(0.0)
+        ).with_columns(
+            (
+                pl.col("fantasy_points_pred")
+                + pl.col("qb_coupling_adjustment_ppr_pg")
+                * pl.col("games_pred")
+            ).alias("fantasy_points_pred")
+        )
+    else:
+        # Always materialize the column so the schema is stable. 0.0 means
+        # "no QB-coupling adjustment applied" — distinct from null which
+        # would mean "player not in cohort"; we use 0 for both because
+        # downstream consumers don't need to distinguish.
+        scored = scored.with_columns(
+            pl.lit(0.0).alias("qb_coupling_adjustment_ppr_pg")
+        )
+
     ranked = _rank_within_position(scored).sort(
         "fantasy_points_pred", descending=True, nulls_last=True
     )

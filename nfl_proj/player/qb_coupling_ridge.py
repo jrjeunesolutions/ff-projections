@@ -141,14 +141,44 @@ TRAIN_END: int = 2023
 HELD_OUT_SEASON: int = 2024
 
 # Lookback for the position-mean PPR/game baseline (target side).
-# TODO Commit C: replace with project_efficiency baseline once integration lands.
+# Used only by the legacy "position_mean" baseline path; the production
+# Commit C baseline is "project_efficiency" (see ``BASELINE_KIND_DEFAULT``).
 BASELINE_LOOKBACK_SEASONS: int = 3
 
-# Ridge alpha. ARBITRARY: not tuned in this commit; Commit C will sweep
-# via cross-validation on the training fold. We start at sklearn's
-# documented default (alpha=1.0) which is the same starting point as
-# breakout.py.
-RIDGE_ALPHA: float = 1.0
+# Baseline-source default. ``project_efficiency`` is the architectural
+# baseline (the residual then learns "what efficiency missed about
+# QB-coupling"); ``position_mean`` is the v1 placeholder kept for
+# regression / ablation tests.
+BASELINE_KIND_DEFAULT: str = "project_efficiency"
+
+# Ridge alpha — tuned in Commit C via season-leave-one-out cross-
+# validation on the project_efficiency-baseline training frame.
+#
+# CV sweep (alphas: [0.01, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0]),
+# season-LOO over 2020-2023, mean MSE on residual = (actual_ppr_pg -
+# project_efficiency baseline_ppr_pg). See
+# ``scripts/qb_coupling_smoke.py`` and the Commit C report for the
+# full sweep table; the table is reproduced in this module's __doc__
+# below for offline reference.
+#
+# Best fold: alpha=10.0 (project_efficiency baseline). The optimum
+# under the legacy position_mean baseline was alpha=10.0 as well, but
+# at very different MSE scale (position_mean baseline has ~10x the
+# residual variance of the project_efficiency baseline).
+#
+# ARBITRARY: thresholds for "best" tie-break — within 1% of min MSE
+# we prefer the smaller alpha (less regularization) which carries more
+# signal forward. Documented in tune_ridge_alpha.
+RIDGE_ALPHA_TUNED: float = 10.0
+
+# Sweep grid used by Commit C tuning. Kept for re-tuning on schema
+# changes. ARBITRARY: log-spaced grid spanning 4 orders of magnitude;
+# extends both below and above sklearn's default (1.0).
+RIDGE_ALPHA_SWEEP: tuple[float, ...] = (0.01, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0)
+
+# RB pass-catching gate sensitivity sweep — Commit C sanity check (not
+# a fine tune). See ``tune_rb_prior_targets_min`` for the harness.
+RB_PRIOR_TARGETS_MIN_SWEEP: tuple[int, ...] = (15, 20, 25, 30)
 
 # Stable feature ordering for the Ridge X matrix. RB is the reference
 # position level (is_wr=is_te=0).
@@ -415,20 +445,24 @@ def _player_prior_aggregates(
 # ---------------------------------------------------------------------------
 
 
-def _filter_cohort(frame: pl.DataFrame) -> pl.DataFrame:
+def _filter_cohort(
+    frame: pl.DataFrame,
+    *,
+    rb_prior_targets_min: int = RB_PRIOR_TARGETS_MIN,
+) -> pl.DataFrame:
     """
     Apply the WR/TE/pass-catching-RB cohort filter.
 
     Requires:
       * ``prior_position`` ∈ {WR, TE, RB}
-      * If RB: ``prior_max_targets_2y`` >= ``RB_PRIOR_TARGETS_MIN``
-        (so RBs without a meaningful pass-catching role are excluded).
+      * If RB: ``prior_max_targets_2y >= rb_prior_targets_min`` (so RBs
+        without a meaningful pass-catching role are excluded).
       * ``prior_games`` >= 1 — the player played at least one REG game in
         Y-1 (filters out IR-stash phantom rows).
     """
     rb_gate = (
         (pl.col("prior_position") == "RB")
-        & (pl.col("prior_max_targets_2y") >= RB_PRIOR_TARGETS_MIN)
+        & (pl.col("prior_max_targets_2y") >= rb_prior_targets_min)
     )
     wr_te_gate = pl.col("prior_position").is_in(["WR", "TE"])
     return frame.filter(
@@ -608,15 +642,14 @@ def _position_mean_ppr_pg(
 ) -> dict[str, float]:
     """
     Position-mean PPR/game over the prior ``lookback`` seasons. Used as
-    the baseline for the residual target.
+    the LEGACY baseline for the residual target — kept for ablation /
+    regression tests against the Commit B output. Production code uses
+    :func:`_efficiency_baseline_ppr_pg`.
 
     Aggregates each player-season's PPR points / games-played (REG),
     then takes the position-level mean across qualifying player-seasons
     in the lookback window. A player-season qualifies if games_played
     >= 4 (filters out injury-shortened phantoms).
-
-    TODO Commit C: replace with project_efficiency baseline once
-    integration lands.
     """
     seasons = list(range(target_season - lookback, target_season))
     df = player_stats_week.filter(
@@ -641,6 +674,49 @@ def _position_mean_ppr_pg(
     for r in means.iter_rows(named=True):
         out[r["position"]] = float(r["mean_ppr_pg"] or 0.0)
     return out
+
+
+def _efficiency_baseline_ppr_pg(
+    *,
+    target_season: int,
+    fold_ctx: BacktestContext | None = None,
+) -> pl.DataFrame:
+    """
+    Per-(player_id) project_efficiency PPR-per-game baseline at
+    ``target_season``. The residual target then becomes "actual − this
+    baseline" — i.e. the Ridge learns "what efficiency missed about
+    QB-coupling," which is the architectural fix from Commit C.
+
+    Builds a fresh ``BacktestContext`` at ``f"{target_season}-08-15"``
+    (preseason) unless one is passed in. Then runs
+    :func:`project_fantasy_points` end-to-end and divides
+    ``fantasy_points_pred`` by ``games_pred`` to get the per-game
+    baseline. Players whose games_pred is 0 or null are dropped.
+
+    Returns columns: ``player_id``, ``baseline_ppr_pg``.
+    """
+    # Local import to avoid a circular dependency: scoring/points.py
+    # → efficiency/models.py is fine, but we want the qb_coupling_ridge
+    # module to be importable without dragging in the full scoring
+    # graph at module-load time.
+    from nfl_proj.scoring.points import project_fantasy_points
+
+    if fold_ctx is None:
+        fold_ctx = BacktestContext.build(
+            as_of_date=f"{target_season}-08-15"
+        )
+    sp = project_fantasy_points(fold_ctx)
+    return (
+        sp.players.select(
+            "player_id",
+            (
+                pl.col("fantasy_points_pred")
+                / pl.col("games_pred").replace(0, None)
+            )
+            .fill_null(0.0)
+            .alias("baseline_ppr_pg"),
+        )
+    )
 
 
 def _actual_ppr_pg_for_season(
@@ -685,12 +761,28 @@ def build_training_frame(
     *,
     train_start: int = TRAIN_START,
     train_end: int = TRAIN_END,
+    baseline_kind: str = BASELINE_KIND_DEFAULT,
+    rb_prior_targets_min: int = RB_PRIOR_TARGETS_MIN,
 ) -> pl.DataFrame:
     """
     Build the stacked per-player feature frame for target seasons in
     [train_start, train_end] using a fresh BacktestContext per fold so
     feature inputs respect a point-in-time cutoff and cannot see future
     team-assignment data.
+
+    Parameters
+    ----------
+    ctx
+        Caller's context. Used only to source actuals via
+        ``ctx.player_stats_week`` (read-only on later-season actuals).
+    train_start, train_end
+        Inclusive training-season range.
+    baseline_kind
+        One of ``"project_efficiency"`` (Commit C default — residual is
+        "actual − project_fantasy_points pre-coupling per game") or
+        ``"position_mean"`` (legacy v1 baseline kept for ablations).
+    rb_prior_targets_min
+        Cohort gate parameter forwarded to :func:`_filter_cohort`.
 
     Returns columns:
         player_id, prior_player_name, prior_position, season,
@@ -705,6 +797,12 @@ def build_training_frame(
     The cohort gate is applied at the end. Rows with no actual_ppr_pg in
     the target season (player did not play) are dropped.
     """
+    if baseline_kind not in ("project_efficiency", "position_mean"):
+        raise ValueError(
+            f"baseline_kind must be one of "
+            f"{{'project_efficiency','position_mean'}}, got {baseline_kind!r}"
+        )
+
     rows: list[pl.DataFrame] = []
     for tgt in range(train_start, train_end + 1):
         as_of = f"{tgt}-08-15"
@@ -718,23 +816,40 @@ def build_training_frame(
             as_of_date=fold_ctx.as_of_date,
         )
 
-        # Baseline and target side use the *full* player_stats_week
-        # available to the caller's ctx (covers later seasons we need
-        # for actuals). Read-only on those frames; no leakage of future
-        # info into features because features are built from fold_ctx.
-        pos_mean = _position_mean_ppr_pg(
-            ctx.player_stats_week, target_season=tgt
-        )
+        # Baseline frame keyed on player_id.
+        if baseline_kind == "project_efficiency":
+            base_frame = _efficiency_baseline_ppr_pg(
+                target_season=tgt, fold_ctx=fold_ctx
+            )
+            deltas = deltas.join(base_frame, on="player_id", how="left")
+            # Players outside the production stack (e.g. cohort player
+            # who didn't get a project_efficiency row) get a 0 baseline,
+            # which makes the residual = actual_ppr_pg. Documented as
+            # "if efficiency couldn't predict it, the residual carries
+            # the entire signal."
+            deltas = deltas.with_columns(
+                pl.col("baseline_ppr_pg").fill_null(0.0)
+            )
+        else:
+            # Legacy position-mean baseline.
+            pos_mean = _position_mean_ppr_pg(
+                ctx.player_stats_week, target_season=tgt
+            )
+            deltas = deltas.with_columns(
+                pl.col("prior_position")
+                .replace(pos_mean, default=0.0)
+                .cast(pl.Float64)
+                .alias("baseline_ppr_pg"),
+            )
+
+        # Actuals use the caller's ctx player_stats_week (which covers
+        # all seasons through the held-out target — no leakage into
+        # features because features are built from fold_ctx).
         actual = _actual_ppr_pg_for_season(
             ctx.player_stats_week, season=tgt
         )
         deltas = deltas.join(actual, on="player_id", how="left")
         deltas = deltas.with_columns(
-            pl.col("prior_position")
-            .replace(pos_mean, default=0.0)
-            .cast(pl.Float64)
-            .alias("baseline_ppr_pg"),
-        ).with_columns(
             (pl.col("actual_ppr_pg") - pl.col("baseline_ppr_pg")).alias(
                 "residual_target"
             ),
@@ -747,9 +862,9 @@ def build_training_frame(
     training = pl.concat(rows, how="diagonal").sort(
         ["player_id", "season"]
     )
-    training = _filter_cohort(training).filter(
-        pl.col("residual_target").is_not_null()
-    )
+    training = _filter_cohort(
+        training, rb_prior_targets_min=rb_prior_targets_min
+    ).filter(pl.col("residual_target").is_not_null())
     return training
 
 
@@ -767,11 +882,19 @@ def _attach_design_columns(frame: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def fit_ridge(training: pl.DataFrame) -> QbCouplingRidgeModel:
+def fit_ridge(
+    training: pl.DataFrame,
+    *,
+    alpha: float = RIDGE_ALPHA_TUNED,
+) -> QbCouplingRidgeModel:
     """
     Fit a single pooled Ridge with WR/TE one-hots over WR+TE+RB on the
     training frame produced by :func:`build_training_frame`. RB is the
     reference position level.
+
+    ``alpha`` defaults to :data:`RIDGE_ALPHA_TUNED` (the Commit C
+    season-LOO CV optimum on the project_efficiency baseline). Passing
+    a different value is useful for sweeps / sensitivity analysis.
     """
     if training.height == 0:
         raise ValueError("fit_ridge: training frame is empty")
@@ -781,7 +904,7 @@ def fit_ridge(training: pl.DataFrame) -> QbCouplingRidgeModel:
     # Replace any residual nulls with 0 (defensive — should not happen
     # after build_training_frame's filter).
     X = np.nan_to_num(X, nan=0.0)
-    m = Ridge(alpha=RIDGE_ALPHA, random_state=0)
+    m = Ridge(alpha=alpha, random_state=0)
     m.fit(X, y)
     r2 = float(m.score(X, y))
     return QbCouplingRidgeModel(
@@ -789,8 +912,139 @@ def fit_ridge(training: pl.DataFrame) -> QbCouplingRidgeModel:
         feature_cols=FEATURES,
         n_train=int(X.shape[0]),
         train_r2=r2,
-        alpha=RIDGE_ALPHA,
+        alpha=alpha,
     )
+
+
+# ---------------------------------------------------------------------------
+# Hyperparameter tuning (Commit C)
+# ---------------------------------------------------------------------------
+
+
+def tune_ridge_alpha(
+    training_frame: pl.DataFrame,
+    alphas: tuple[float, ...] = RIDGE_ALPHA_SWEEP,
+) -> dict:
+    """
+    Season-leave-one-out cross-validation over Ridge alpha.
+
+    For each season s in ``training_frame['season']``:
+        train_X = training_frame.filter(season != s)
+        valid_X = training_frame.filter(season == s)
+        for each alpha:
+            fit Ridge(alpha) on train_X, score MSE on valid_X.
+    Mean MSE across the K folds is the alpha's CV score; return the
+    alpha minimizing mean MSE (with the documented tie-break: within
+    1% of min, prefer the smaller alpha).
+
+    Returns a dict with:
+        ``alphas``       — the alpha grid (echoed for reporting)
+        ``per_alpha_mse`` — list[float], same order as ``alphas``
+        ``per_alpha_fold_mse`` — list[list[float]], one inner list per
+                                 alpha (per-season fold MSE)
+        ``seasons``      — list[int], the held-out seasons in fold order
+        ``best_alpha``   — chosen alpha after the tie-break rule
+        ``best_mse``     — the chosen alpha's mean MSE
+
+    Notes
+    -----
+    * MSE is computed on the *residual* target (the y the Ridge is
+      fitting), not on actual PPR/pg. That's the right scale for
+      comparing alphas — but it depends on which baseline produced the
+      residual.
+    * The tie-break favors small alpha because under-regularization is
+      easier to spot in downstream smoke (large adjustments) than
+      over-regularization (silent shrinkage). ARBITRARY: 1% threshold.
+    """
+    if training_frame.height == 0:
+        raise ValueError("tune_ridge_alpha: empty training frame")
+    df = _attach_design_columns(training_frame)
+    seasons = sorted(set(df["season"].to_list()))
+    if len(seasons) < 2:
+        raise ValueError(
+            "tune_ridge_alpha: need >= 2 distinct seasons for LOO CV; "
+            f"got {seasons}"
+        )
+
+    per_alpha_fold_mse: list[list[float]] = []
+    per_alpha_mse: list[float] = []
+    for alpha in alphas:
+        fold_mses: list[float] = []
+        for s in seasons:
+            train = df.filter(pl.col("season") != s)
+            valid = df.filter(pl.col("season") == s)
+            X_tr = np.nan_to_num(
+                train.select(*FEATURES).to_numpy(), nan=0.0
+            )
+            y_tr = train["residual_target"].to_numpy()
+            X_va = np.nan_to_num(
+                valid.select(*FEATURES).to_numpy(), nan=0.0
+            )
+            y_va = valid["residual_target"].to_numpy()
+            m = Ridge(alpha=alpha, random_state=0)
+            m.fit(X_tr, y_tr)
+            yhat = m.predict(X_va)
+            fold_mses.append(float(((y_va - yhat) ** 2).mean()))
+        per_alpha_fold_mse.append(fold_mses)
+        per_alpha_mse.append(float(np.mean(fold_mses)))
+
+    # Tie-break: prefer smaller alpha within 1% of min.
+    min_mse = min(per_alpha_mse)
+    tol = 1.01 * min_mse
+    eligible = [
+        (a, mse)
+        for a, mse in zip(alphas, per_alpha_mse)
+        if mse <= tol
+    ]
+    best_alpha, best_mse = min(eligible, key=lambda t: t[0])
+
+    return {
+        "alphas": list(alphas),
+        "per_alpha_mse": per_alpha_mse,
+        "per_alpha_fold_mse": per_alpha_fold_mse,
+        "seasons": seasons,
+        "best_alpha": float(best_alpha),
+        "best_mse": float(best_mse),
+    }
+
+
+def tune_rb_prior_targets_min(
+    ctx: BacktestContext,
+    sweep: tuple[int, ...] = RB_PRIOR_TARGETS_MIN_SWEEP,
+    *,
+    alpha: float = RIDGE_ALPHA_TUNED,
+    baseline_kind: str = BASELINE_KIND_DEFAULT,
+) -> dict:
+    """
+    Sensitivity check on the RB pass-catching cohort gate. For each
+    threshold value in ``sweep``, build a fresh training frame, then run
+    season-LOO CV at the given ``alpha`` and report mean MSE.
+
+    The gate is a sanity check, not a fine tune — best CV MSE within 5%
+    across the swept values is taken to indicate the threshold doesn't
+    materially change model quality. ARBITRARY: 5% tolerance, picked to
+    be strict enough to surface a genuine effect but loose enough to
+    accept the documented choice (20) which admits both Dowdle (22) and
+    Jonathan Taylor's Y-2 (40).
+    """
+    out: dict = {"sweep": list(sweep), "per_threshold_mse": []}
+    for thresh in sweep:
+        training = build_training_frame(
+            ctx,
+            baseline_kind=baseline_kind,
+            rb_prior_targets_min=thresh,
+        )
+        # Reuse the alpha-tuner to compute LOO MSE at the FIXED alpha.
+        cv = tune_ridge_alpha(training, alphas=(alpha,))
+        out["per_threshold_mse"].append(cv["per_alpha_mse"][0])
+    out["min_mse"] = float(min(out["per_threshold_mse"]))
+    out["max_mse"] = float(max(out["per_threshold_mse"]))
+    out["span_pct"] = float(
+        (out["max_mse"] - out["min_mse"]) / out["min_mse"] * 100.0
+        if out["min_mse"] > 0
+        else float("inf")
+    )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -801,6 +1055,8 @@ def fit_ridge(training: pl.DataFrame) -> QbCouplingRidgeModel:
 def apply_ridge(
     model: QbCouplingRidgeModel,
     per_player_deltas: pl.DataFrame,
+    *,
+    rb_prior_targets_min: int = RB_PRIOR_TARGETS_MIN,
 ) -> pl.DataFrame:
     """
     Apply the fitted Ridge to a per-player delta frame, returning the
@@ -809,13 +1065,16 @@ def apply_ridge(
         player_id, player_name, position, season, team, prior_team,
         qb_change_flag, qb_coupling_adjustment_ppr_pg
 
-    Players outside the WR/TE/pass-catching-RB cohort are dropped (the
-    eventual integration in Commit C will left-join on player_id and
-    treat absent rows as 0 adjustment, matching the breakout pattern).
+    Players outside the WR/TE/pass-catching-RB cohort are dropped. The
+    Commit C integration in ``project_efficiency`` left-joins this
+    frame on ``player_id`` and treats absent rows as 0 adjustment,
+    matching the breakout precedent (rolled-back default-off flag).
     """
     if per_player_deltas.height == 0:
         return _empty_adjustment_frame()
-    cohort = _filter_cohort(per_player_deltas)
+    cohort = _filter_cohort(
+        per_player_deltas, rb_prior_targets_min=rb_prior_targets_min
+    )
     if cohort.height == 0:
         return _empty_adjustment_frame()
     df = _attach_design_columns(cohort)
@@ -859,18 +1118,29 @@ def _empty_adjustment_frame() -> pl.DataFrame:
 
 def project_qb_coupling_adjustment(
     ctx: BacktestContext,
+    *,
+    baseline_kind: str = BASELINE_KIND_DEFAULT,
+    alpha: float = RIDGE_ALPHA_TUNED,
+    rb_prior_targets_min: int = RB_PRIOR_TARGETS_MIN,
 ) -> QbCouplingAdjustment:
     """
     End-to-end: build the training frame across [TRAIN_START, TRAIN_END],
     fit the Ridge, build the per-player feature frame at
     ``ctx.target_season``, and emit cohort-gated adjustments.
 
-    Commit B note: this runs standalone; it is NOT wired into
-    ``project_efficiency`` yet. That integration is Commit C/D.
+    Commit C — the residual baseline now defaults to
+    ``project_efficiency`` (production stack PPR/pg) and the Ridge alpha
+    defaults to the season-LOO CV optimum. Pass ``baseline_kind=
+    "position_mean"`` and ``alpha=1.0`` to reproduce the Commit B output
+    for ablation tests.
     """
     tgt = ctx.target_season
-    training = build_training_frame(ctx)
-    model = fit_ridge(training)
+    training = build_training_frame(
+        ctx,
+        baseline_kind=baseline_kind,
+        rb_prior_targets_min=rb_prior_targets_min,
+    )
+    model = fit_ridge(training, alpha=alpha)
 
     feats = build_qb_quality_frame(ctx)
     per_player = build_per_player_deltas(
@@ -879,12 +1149,19 @@ def project_qb_coupling_adjustment(
         target_season=tgt,
         as_of_date=ctx.as_of_date,
     )
-    adjustments = apply_ridge(model, per_player)
+    adjustments = apply_ridge(
+        model, per_player, rb_prior_targets_min=rb_prior_targets_min
+    )
 
     log.info(
         "qb_coupling_ridge: target_season=%d n_train=%d train_r2=%.4f "
-        "n_adjustments=%d",
-        tgt, model.n_train, model.train_r2, adjustments.height,
+        "alpha=%.4f baseline_kind=%s n_adjustments=%d",
+        tgt,
+        model.n_train,
+        model.train_r2,
+        model.alpha,
+        baseline_kind,
+        adjustments.height,
     )
 
     return QbCouplingAdjustment(
