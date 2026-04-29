@@ -152,6 +152,64 @@ def main() -> None:
     print("  - Drake London      (ATL): Ridder  → Cousins")
     print("  - Rico Dowdle       (DAL): Prescott→ Prescott (no QB change)")
 
+    # ----------------------------------------------------------------------
+    # (6) Per-player Ridge adjustments (Commit B) for the 5 named misses.
+    #     Adjustments must be non-zero for the 4 with QB changes; Dowdle's
+    #     should be ≈0 (DAL had Dak both years, no change).
+    # ----------------------------------------------------------------------
+    from nfl_proj.player.qb_coupling_ridge import (
+        project_qb_coupling_adjustment,
+    )
+
+    print("\n(6) Per-player Ridge adjustments (Commit B) for the 5 named misses")
+    print("-" * 72)
+    artifacts = project_qb_coupling_adjustment(ctx)
+    print(
+        f"training rows: {artifacts.model.n_train}  "
+        f"train_r2: {artifacts.model.train_r2:.4f}  "
+        f"alpha: {artifacts.model.alpha}"
+    )
+    print(f"adjustment rows: {artifacts.adjustments.height}")
+
+    miss_ids = [
+        "00-0036322",  # Justin Jefferson  (MIN)
+        "00-0036223",  # Jonathan Taylor   (IND)
+        "00-0038542",  # Bijan Robinson    (ATL)
+        "00-0037238",  # Drake London      (ATL)
+        "00-0036139",  # Rico Dowdle       (DAL)
+    ]
+    miss_rows = artifacts.adjustments.filter(
+        pl.col("player_id").is_in(miss_ids)
+    ).sort("player_name")
+    print(miss_rows.select(
+        "player_name",
+        "position",
+        "team",
+        "prior_team",
+        "qb_change_flag",
+        pl.col("qb_coupling_adjustment_ppr_pg").round(4),
+    ))
+
+    # Mover-case verification: print one player whose prior_team !=
+    # current_team, demonstrating the per-player delta uses the prior
+    # team's QB row (not the current team's).
+    movers = artifacts.per_player_deltas.filter(
+        pl.col("prior_team") != pl.col("current_team")
+    ).sort("prior_targets_per_game", descending=True)
+    if movers.height > 0:
+        print("\nMover-case trace (top by prior_targets_per_game):")
+        print(movers.select(
+            "prior_player_name",
+            "prior_position",
+            "prior_team",
+            "current_team",
+            pl.col("prior_qb_name").alias("prior_team_qb_y_minus_1"),
+            pl.col("projected_starter_name").alias("current_team_proj_qb_y"),
+            pl.col("ypa_delta").round(3),
+            pl.col("pass_atts_pg_delta").round(2),
+            "qb_change_flag",
+        ).head(5))
+
 
 if __name__ == "__main__":
     main()
