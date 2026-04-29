@@ -510,6 +510,7 @@ def project_fantasy_points(
     rookies: RookieProjection | None = None,
     qb: QBProjection | None = None,
     apply_qb_coupling: bool = False,
+    apply_qb_situation: bool = False,
 ) -> ScoringProjection:
     """
     Run every upstream projection (or reuse passed-in results) and fold
@@ -530,7 +531,22 @@ def project_fantasy_points(
         Players outside the cohort (QBs, low-target RBs, players whose
         team had no QB-environment delta) get adjustment=0 via the
         left-join.
+
+    apply_qb_situation : bool, default False
+        Phase 8c Part 3 categorical QB-coupling integration. When True,
+        applies the per-player adjustment from
+        :func:`nfl_proj.player.qb_coupling_categorical.project_qb_situation_adjustment`
+        as an additive delta. Mutually exclusive with ``apply_qb_coupling``
+        (the linear-Ridge variant) — the two architectures address the
+        same thesis with different model classes; they should not be
+        applied simultaneously.
     """
+    if apply_qb_coupling and apply_qb_situation:
+        raise ValueError(
+            "apply_qb_coupling and apply_qb_situation are mutually exclusive — "
+            "two different architectures for the same QB-coupling thesis. "
+            "Pick one."
+        )
     team = team or project_team_season(ctx)
     gamescript = gamescript or project_gamescript(ctx, team_result=team)
     play_calling = play_calling or project_play_calling(ctx, team_result=team)
@@ -612,6 +628,36 @@ def project_fantasy_points(
         # downstream consumers don't need to distinguish.
         scored = scored.with_columns(
             pl.lit(0.0).alias("qb_coupling_adjustment_ppr_pg")
+        )
+
+    # Phase 8c Part 3 — categorical QB-situation adjustment, default-off.
+    # Same integration shape as apply_qb_coupling but sourcing from a
+    # category-conditional model (qb_coupling_categorical) instead of a
+    # linear Ridge.
+    if apply_qb_situation:
+        from nfl_proj.player.qb_coupling_categorical import (
+            project_qb_situation_adjustment,
+        )
+
+        sit_adj = project_qb_situation_adjustment(ctx)
+        scored = scored.join(
+            sit_adj.per_player.select(
+                "player_id", "qb_situation_adjustment_ppr_pg"
+            ),
+            on="player_id",
+            how="left",
+        ).with_columns(
+            pl.col("qb_situation_adjustment_ppr_pg").fill_null(0.0)
+        ).with_columns(
+            (
+                pl.col("fantasy_points_pred")
+                + pl.col("qb_situation_adjustment_ppr_pg")
+                * pl.col("games_pred")
+            ).alias("fantasy_points_pred")
+        )
+    else:
+        scored = scored.with_columns(
+            pl.lit(0.0).alias("qb_situation_adjustment_ppr_pg")
         )
 
     ranked = _rank_within_position(scored).sort(
