@@ -320,6 +320,40 @@ def _veteran_counting_stats(
         pl.col("target_share_pred").fill_null(0.0),
         pl.col("rush_share_pred").fill_null(0.0),
     )
+
+    # PER-TEAM SHARE NORMALIZATION (added 2026-04-30): the share model
+    # predicts each player's share independently using their *prior team's*
+    # historical context, then we re-attribute them to their as_of team.
+    # Result: per-team sums of target_share + rush_share don't add up
+    # to 1.0 — over-attribution when multiple players bring high prior
+    # shares to the same new team (e.g. HOU 132% post-active-filter,
+    # because new RBs all carry Y-1 shares from prior teams), and
+    # under-attribution when a team's depth chart is thin or rookie-
+    # heavy (JAX 50% — only Tuten with thin Y-1 sample).
+    #
+    # Renormalizing each team's predicted shares to sum to exactly 1.0
+    # corrects both directions: over-attributed teams are scaled down so
+    # phantom contributions don't double-count, under-attributed teams
+    # are scaled up so the lead back actually projects as the lead back
+    # (Tuten's 16% share scales to ~32% when he's the team's only
+    # qualifying RB). Done before games_scalar so partial-season
+    # availability is still honored on top of the corrected shares.
+    team_share_totals = merged.group_by("team").agg(
+        pl.col("target_share_pred").sum().alias("team_ts_total"),
+        pl.col("rush_share_pred").sum().alias("team_rs_total"),
+    )
+    merged = merged.join(team_share_totals, on="team", how="left")
+    merged = merged.with_columns(
+        pl.when(pl.col("team_ts_total") > 0)
+        .then(pl.col("target_share_pred") / pl.col("team_ts_total"))
+        .otherwise(pl.col("target_share_pred"))
+        .alias("target_share_pred"),
+        pl.when(pl.col("team_rs_total") > 0)
+        .then(pl.col("rush_share_pred") / pl.col("team_rs_total"))
+        .otherwise(pl.col("rush_share_pred"))
+        .alias("rush_share_pred"),
+    ).drop(["team_ts_total", "team_rs_total"])
+
     merged = merged.with_columns(
         (
             pl.col("team_targets")

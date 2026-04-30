@@ -242,8 +242,17 @@ def _fit_share_model(
 
 def _predict_share(trained: ShareModel, history: pl.DataFrame) -> pl.DataFrame:
     frame = _metric_frame(history, trained.metric)
+    # Inference uses a much lower floor than training (USAGE_THRESHOLD,
+    # 2%) — that threshold ensures clean training rows but excluding
+    # below-threshold players from PREDICTION drops backups who started
+    # part-time, blocking TEs, change-of-pace RBs, etc. They're real
+    # 2026 roster players and the front office needs them in context;
+    # their predicted shares will be low (correctly) rather than missing
+    # entirely. Floor is null-safe + non-zero (0.0% prior produces a
+    # zero prediction, not noise) so we keep prior1 > 0.0 rather than
+    # prior1 > USAGE_THRESHOLD.
     usable = frame.filter(
-        pl.col("prior1").is_not_null() & (pl.col("prior1") > USAGE_THRESHOLD)
+        pl.col("prior1").is_not_null() & (pl.col("prior1") > 0.0)
     ).with_columns(
         pl.col("prior2").fill_null(pl.col("prior1")),
         pl.col("prior3").fill_null(pl.col("prior1")),
