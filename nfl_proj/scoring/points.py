@@ -572,14 +572,28 @@ def project_fantasy_points(
     # 1) QB projections (passing + rushing) — beat everything else for QBs
     # 2) Rookie model — beats veteran model for rookie IDs
     # 3) Veteran opportunity+efficiency — default
-    qb_ids = qbs.select("player_id").to_series().to_list()
-    rookie_ids = rooks.select("player_id").to_series().to_list()
+    #
+    # NULL-player_id handling: project_rookies returns rows with
+    # ``player_id = None`` for prospects who haven't been matched to a
+    # gsis_id yet (the typical 2026 first-year case in April/May before
+    # nflreadpy ingests the rookie class). polars ``is_in([str,...])``
+    # returns null for null inputs, ``~null`` is null, and ``filter(null)``
+    # drops the row — so a naive filter would silently delete every
+    # null-pid rookie. We add the explicit ``is_null()`` guard to keep
+    # them. Vets and QBs always have non-null pids by upstream contract.
+    qb_ids = qbs.select("player_id").drop_nulls().to_series().to_list()
+    rookie_ids = (
+        rooks.select("player_id").drop_nulls().to_series().to_list()
+    )
 
     vets_filtered = vets.filter(
         ~pl.col("player_id").is_in(qb_ids)
         & ~pl.col("player_id").is_in(rookie_ids)
     )
-    rooks_filtered = rooks.filter(~pl.col("player_id").is_in(qb_ids))
+    rooks_filtered = rooks.filter(
+        pl.col("player_id").is_null()
+        | ~pl.col("player_id").is_in(qb_ids)
+    )
 
     combined = pl.concat(
         [vets_filtered, rooks_filtered, qbs], how="diagonal_relaxed"
