@@ -40,6 +40,44 @@ TEAM_CODE_CANON = {
 }
 
 
+def derive_starters_from_depth_charts(seasons: list[int]) -> pl.DataFrame:
+    """Forward-looking source: latest depth chart snapshot per team for
+    each target season, taking pos_rank=1 as the projected QB1.
+
+    Used for upcoming seasons (no game logs yet) — e.g. 2026 projections
+    at preseason. Produces the same shape as ``derive_starters`` so the
+    two can be merged.
+    """
+    if not seasons:
+        return pl.DataFrame()
+    dc = nfl.load_depth_charts(seasons=seasons).filter(
+        (pl.col("pos_abb") == "QB") & (pl.col("pos_rank") == 1)
+    )
+    if dc.is_empty():
+        return pl.DataFrame()
+    # Take the latest snapshot per (team) — the most recent depth-chart
+    # update is the best forward-looking proxy. ISO 8601 strings sort
+    # correctly without parsing.
+    latest = (
+        dc.sort(["team", "dt"], descending=[False, True])
+        .group_by("team", maintain_order=True)
+        .first()
+    )
+    # Normalize team codes to canonical (LA→LAR, etc.)
+    latest = latest.with_columns(
+        pl.col("team").replace(TEAM_CODE_CANON).alias("team")
+    )
+    out = latest.select(
+        pl.lit(seasons[-1]).cast(pl.Int32).alias("season"),  # forward season is the latest in the list
+        "team",
+        pl.col("gsis_id").alias("player_id"),
+        pl.col("player_name").alias("player_display_name"),
+        pl.lit(None).cast(pl.Int32).alias("attempts"),
+        pl.lit(None).cast(pl.Int32).alias("passing_yards"),
+    )
+    return out
+
+
 def derive_starters(seasons: list[int]) -> pl.DataFrame:
     """Return a frame with one row per (season, team) Week-1 QB starter.
 
@@ -130,6 +168,18 @@ def merge(
         note = note_lookup.get((season, team, player_name), "")
         if note.startswith("VERIFY:"):
             note = ""
+        # Distinguish source: game-log-derived rows have non-null
+        # attempts; depth-chart-derived rows have null attempts.
+        if r.get("attempts") is None:
+            source_url = (
+                f"derived from nflreadpy.load_depth_charts(seasons=[{season}]) "
+                f"latest snapshot, pos_rank=1 (forward-looking — no game logs yet)"
+            )
+        else:
+            source_url = (
+                f"derived from nflreadpy.load_player_stats(seasons=[{season}]) "
+                f"REG W1 max(attempts)"
+            )
         out.append(
             {
                 "season": str(season),
@@ -137,10 +187,7 @@ def merge(
                 "depth_order": "1",
                 "player_id": player_id,
                 "player_name": player_name,
-                "source_url": (
-                    f"derived from nflreadpy.load_player_stats(seasons=[{season}]) "
-                    f"REG W1 max(attempts)"
-                ),
+                "source_url": source_url,
                 "note": note,
             }
         )
@@ -169,6 +216,14 @@ def main() -> int:
         help="Seasons to derive from game logs.",
     )
     parser.add_argument(
+        "--forward-seasons",
+        nargs="*",
+        type=int,
+        default=[],
+        help="Upcoming seasons (no game logs yet) to derive from the "
+             "latest nflreadpy depth-chart snapshot. E.g. --forward-seasons 2026.",
+    )
+    parser.add_argument(
         "--csv",
         type=Path,
         default=CSV_PATH,
@@ -183,11 +238,23 @@ def main() -> int:
 
     print(f"Deriving Week-1 starters for seasons: {args.seasons}")
     derived = derive_starters(args.seasons)
-    print(f"Derived {derived.height} (season, team) rows.")
+    print(f"Derived {derived.height} (season, team) rows from game logs.")
+
+    forward = pl.DataFrame()
+    if args.forward_seasons:
+        print(f"Deriving forward-looking starters for: {args.forward_seasons}")
+        for fs in args.forward_seasons:
+            f_rows = derive_starters_from_depth_charts([fs])
+            if not f_rows.is_empty():
+                forward = pl.concat([forward, f_rows]) if not forward.is_empty() else f_rows
+        print(f"Derived {forward.height} forward (season, team) rows from depth charts.")
+        derived = pl.concat([derived, forward]) if not forward.is_empty() else derived
+
     print(derived.sort(["season", "team"]))
 
     existing = load_existing_csv(args.csv)
-    merged = merge(existing, derived, args.seasons)
+    seasons_replaced = list(args.seasons) + list(args.forward_seasons)
+    merged = merge(existing, derived, seasons_replaced)
 
     if args.dry_run:
         print(f"[dry-run] Would write {len(merged)} rows to {args.csv}")

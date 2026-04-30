@@ -97,7 +97,10 @@ def _normalise_team(team: str | None) -> str | None:
 @functools.lru_cache(maxsize=1)
 def _rosters_all() -> pl.DataFrame:
     """Annual rosters across all available seasons."""
-    seasons = list(range(2015, 2026))
+    # Range must include the current calendar year so offseason moves
+    # (e.g. Cousins → LV in March 2026) propagate before weekly rosters
+    # populate at preseason. ``+1`` because Python ranges are exclusive.
+    seasons = list(range(2015, date.today().year + 1))
     df = loaders.load_rosters(seasons)
     return df.select(
         "season",
@@ -109,8 +112,13 @@ def _rosters_all() -> pl.DataFrame:
 
 @functools.lru_cache(maxsize=1)
 def _rosters_weekly_all() -> pl.DataFrame:
-    """Weekly rosters with a derived per-week date."""
-    seasons = list(range(2015, 2026))
+    """Weekly rosters with a derived per-week date.
+
+    Weekly rosters only exist for seasons that have started; nflreadpy
+    rejects future-season requests. We cap at last completed year so the
+    function works year-round.
+    """
+    seasons = list(range(2015, date.today().year))
     df = loaders.load_rosters_weekly(seasons)
     # Join schedules to get a concrete date per (season, week).
     sched = loaders.load_schedules(seasons).select(
