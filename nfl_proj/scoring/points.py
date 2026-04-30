@@ -44,9 +44,12 @@ Baseline for validation: the player's prior-year actual PPR points
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import polars as pl
+
+log = logging.getLogger(__name__)
 
 from nfl_proj.availability.models import (
     AvailabilityProjection,
@@ -157,6 +160,48 @@ def _normalise_team_expr(col: str) -> pl.Expr:
     return expr
 
 
+def _current_season_active_player_ids(ctx: BacktestContext) -> set[str] | None:
+    """Return the set of gsis_ids on any 2026 (or ctx-year) roster.
+
+    Used to filter out retired / unsigned players from the veteran
+    projection pipeline. Returns ``None`` (no-filter sentinel) if the
+    nflreadpy roster pull fails or returns empty — the caller falls
+    back to keeping all players in that case rather than dropping the
+    whole vet frame.
+
+    Includes all roster statuses (ACT, RES, PUP, IR, NWT, IST, …) —
+    the filter is "is this player on a 2026 NFL roster at all?" not
+    "are they currently active". Practice-squad and IR-stash players
+    might still play; only the literally-not-on-any-roster cases
+    (retired QBs, unsigned veterans) get dropped.
+    """
+    try:
+        import nflreadpy as nfl
+    except ImportError:
+        return None
+    try:
+        # Use the as_of's calendar year; falls back to current year if
+        # the date is mid-season ambiguous.
+        year = ctx.as_of_date.year if hasattr(ctx, "as_of_date") else None
+        if year is None:
+            from datetime import date as _date
+            year = _date.today().year
+        rosters = nfl.load_rosters(seasons=[year])
+        ids = (
+            rosters.select("gsis_id")
+            .drop_nulls("gsis_id")
+            .unique()
+            .get_column("gsis_id")
+            .to_list()
+        )
+        if not ids:
+            return None
+        return set(ids)
+    except Exception as e:
+        log.warning("_current_season_active_player_ids: nflreadpy failed (%s); skipping filter", e)
+        return None
+
+
 def _last_team_per_player(history: pl.DataFrame) -> pl.DataFrame:
     """
     (player_id) -> their most-recent observed dominant team, normalized to
@@ -223,6 +268,18 @@ def _veteran_counting_stats(
     history = build_player_season_opportunity(ctx)
     last_team = _last_team_per_player(history).rename({"team": "team_last_observed"})
 
+    # ACTIVE-ROSTER FILTER (added 2026-04-30): drop players who aren't
+    # on any current-season nflreadpy roster. Without this, retired
+    # players (Carson Palmer last on ARI 2017, A.J. Green on ARI 2020,
+    # Cam Newton on CAR, etc.) keep absorbing share-based projections
+    # via the team_last_observed fallback — inflating per-team target
+    # and rush totals well above 100% (audited at 112% / 127% league
+    # avg before this fix). The filter excludes any player_id not in
+    # nflreadpy's current-season roster set; it does NOT filter on
+    # status='ACT' specifically, so PUP/IR/IST players are kept (they
+    # may yet contribute snaps).
+    active_pids = _current_season_active_player_ids(ctx)
+
     merged = (
         opp_f
         .join(eff_f, on="player_id", how="left")
@@ -236,6 +293,14 @@ def _veteran_counting_stats(
         )
         .drop(["team_asof", "team_last_observed"])
     )
+    if active_pids is not None:
+        before_n = merged.height
+        merged = merged.filter(pl.col("player_id").is_in(active_pids))
+        log.info(
+            "_veteran_counting_stats: active-roster filter dropped "
+            "%d/%d rows (retired/unsigned/cross-season ghosts)",
+            before_n - merged.height, before_n,
+        )
     merged = merged.join(team_vol, on="team", how="left")
 
     # Default games = SEASON_GAMES if no availability projection (very
