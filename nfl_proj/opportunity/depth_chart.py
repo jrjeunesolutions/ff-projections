@@ -435,11 +435,27 @@ def apply_lead_starter_games_floor(
 
     merged = merged.join(starters, on=["player_id", "team"], how="left").with_columns(
         pl.col("_games_floor").fill_null(0.0),
-    ).with_columns(
-        pl.max_horizontal(pl.col("games_pred"), pl.col("_games_floor"))
-          .alias("games_pred"),
-    ).drop("_games_floor")
-
+    )
+    # Skip the floor when a manual override is present — the user's
+    # explicit attestation about expected games beats the
+    # position-typical floor. ``is_games_overridden`` is set in
+    # ``nfl_proj/availability/models.py:project_availability``.
+    has_override_col = "is_games_overridden" in merged.columns
+    if has_override_col:
+        merged = merged.with_columns(
+            pl.when(pl.col("is_games_overridden"))
+              .then(pl.col("games_pred"))
+              .otherwise(
+                  pl.max_horizontal(pl.col("games_pred"), pl.col("_games_floor"))
+              )
+              .alias("games_pred"),
+        )
+    else:
+        merged = merged.with_columns(
+            pl.max_horizontal(pl.col("games_pred"), pl.col("_games_floor"))
+              .alias("games_pred"),
+        )
+    merged = merged.drop("_games_floor")
     return merged
 
 

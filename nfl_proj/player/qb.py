@@ -704,9 +704,14 @@ def project_qb(
     ).select("player_id", pl.col("team").alias("team"))
 
     team_att = _team_pass_attempts(team_proj, play_calling)
-    avail = availability.projections.select(
-        "player_id", pl.col("games_pred"),
-    )
+    # Pass through the override flag too (set by
+    # nfl_proj/availability/models.py:project_availability) so the
+    # depth-chart QB1 floor can skip rows the user has explicitly
+    # overridden.
+    avail_cols = ["player_id", "games_pred"]
+    if "is_games_overridden" in availability.projections.columns:
+        avail_cols.append("is_games_overridden")
+    avail = availability.projections.select(avail_cols)
 
     # Drop QBs without a team (unsigned / unknown).
     merged = (
@@ -716,10 +721,14 @@ def project_qb(
     )
 
     # Default games = SEASON_GAMES for QBs missing from the availability
-    # projection (very thin history).
-    merged = merged.with_columns(
-        pl.col("games_pred").fill_null(float(SEASON_GAMES)),
-    )
+    # projection (very thin history). Default override-flag = False
+    # for QBs that didn't appear in the availability frame.
+    fill_cols = [pl.col("games_pred").fill_null(float(SEASON_GAMES))]
+    if "is_games_overridden" in merged.columns:
+        fill_cols.append(pl.col("is_games_overridden").fill_null(False))
+    else:
+        fill_cols.append(pl.lit(False).alias("is_games_overridden"))
+    merged = merged.with_columns(fill_cols)
 
     # LIVE-MODE-ONLY depth-chart-aware QB games allocation
     # (added 2026-05-01, extended same day).
@@ -776,10 +785,15 @@ def project_qb(
                 qb_dc, on=["player_id", "team"], how="left",
             )
 
-            # Step 1: floor QB1 games at the depth-chart floor.
+            # Step 1: floor QB1 games at the depth-chart floor —
+            # but skip rows with a manual override (user's explicit
+            # attestation beats the position-typical floor).
             if qb_games_floor > 0:
                 merged = merged.with_columns(
-                    pl.when(pl.col("depth_rank") == 1)
+                    pl.when(
+                        (pl.col("depth_rank") == 1)
+                        & ~pl.col("is_games_overridden")
+                    )
                       .then(
                           pl.max_horizontal(
                               pl.col("games_pred"),
@@ -811,7 +825,11 @@ def project_qb(
                 (pl.col("games_pred") / SEASON_GAMES)
                     .clip(0.0, 1.0).alias("_avail_rate"),
             ).with_columns(
-                pl.when(pl.col("depth_rank") == 1)
+                # Override beats everything: depth-chart floor, joint
+                # allocation, mop-up floor.
+                pl.when(pl.col("is_games_overridden"))
+                  .then(pl.col("games_pred"))
+                  .when(pl.col("depth_rank") == 1)
                   .then(pl.col("games_pred"))
                   .when(pl.col("depth_rank") == 2)
                   .then(

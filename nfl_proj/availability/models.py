@@ -153,4 +153,27 @@ def project_availability(ctx: BacktestContext) -> AvailabilityProjection:
                 "games_baseline": r["games_baseline"],
             }
         )
-    return AvailabilityProjection(projections=pl.DataFrame(rows))
+    proj = pl.DataFrame(rows)
+
+    # Manual overrides — user front-office intel beats the model.
+    # Adds an ``is_games_overridden`` flag the depth-chart floors check
+    # so they don't paper over an explicit override.
+    from nfl_proj.data.games_overrides import get_games_overrides
+    overrides = get_games_overrides(ctx.as_of_date).rename(
+        {"games_pred": "_override_games_pred"}
+    )
+    if overrides.height > 0 and proj.height > 0:
+        proj = proj.join(overrides, on="player_id", how="left").with_columns(
+            pl.when(pl.col("_override_games_pred").is_not_null())
+              .then(pl.col("_override_games_pred"))
+              .otherwise(pl.col("games_pred"))
+              .alias("games_pred"),
+            pl.col("_override_games_pred").is_not_null()
+              .alias("is_games_overridden"),
+        ).drop("_override_games_pred")
+    else:
+        proj = proj.with_columns(
+            pl.lit(False).alias("is_games_overridden"),
+        )
+
+    return AvailabilityProjection(projections=proj)
