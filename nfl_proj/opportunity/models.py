@@ -169,6 +169,7 @@ FEATURES: tuple[str, ...] = (
     "prior3",
     "games_prior1",
     "years_played",
+    "consistency",  # min(prior1, prior2): stable high-share vs one-year spike
 )
 
 
@@ -181,10 +182,27 @@ class ShareModel:
     train_r2: float
 
 
+# Positions for which rush_share has real signal in priors. Backtest
+# (2023-2025) showed: QB +7.9% lift, gadget-WR (prior1 > 0.02) +6.7%.
+# RB rush_share is a near-random-walk (prior1 is the best estimator);
+# WR below the gadget threshold and TE/other are noise-floor cohorts.
+RUSH_SHARE_MODELED_POSITIONS: tuple[str, ...] = ("QB", "WR")
+
+
+@dataclass(frozen=True)
+class RushShareModel:
+    """Per-position Ridge bundle for rush_share. Positions not in
+    ``models`` fall back to prior1 baseline at predict time."""
+    models: dict[str, Ridge]  # position -> fitted Ridge
+    feature_cols: tuple[str, ...]
+    n_train: dict[str, int]
+    train_r2: dict[str, float]
+
+
 @dataclass(frozen=True)
 class OpportunityProjection:
     target_share_model: ShareModel
-    rush_share_model: ShareModel
+    rush_share_model: RushShareModel
     projections: pl.DataFrame  # player_id, player_display_name, position,
                                # season (=target), target_share_pred,
                                # target_share_baseline, rush_share_pred,
@@ -223,6 +241,9 @@ def _fit_share_model(
         pl.col("games_prior1").fill_null(0).cast(pl.Float64),
         pl.col("years_played").fill_null(1).cast(pl.Float64),
     )
+    train = train.with_columns(
+        pl.min_horizontal("prior1", "prior2").alias("consistency"),
+    )
     if train.height < 50:
         raise ValueError(
             f"_fit_share_model({metric}): only {train.height} rows."
@@ -259,6 +280,9 @@ def _predict_share(trained: ShareModel, history: pl.DataFrame) -> pl.DataFrame:
         pl.col("games_prior1").fill_null(0).cast(pl.Float64),
         pl.col("years_played").fill_null(1).cast(pl.Float64),
     )
+    usable = usable.with_columns(
+        pl.min_horizontal("prior1", "prior2").alias("consistency"),
+    )
     X = usable.select(*trained.feature_cols).to_numpy()
     residuals = trained.model.predict(X)
     base = usable["prior1"].to_numpy()
@@ -292,13 +316,32 @@ def _predict_share(trained: ShareModel, history: pl.DataFrame) -> pl.DataFrame:
     # on WRs.
     raw_p1 = usable["prior1"].to_numpy()
     raw_p2 = usable.get_column("prior2").fill_null(0.0).to_numpy()
-    # Stable: at least two consecutive elite seasons. Floor at the
-    # MAX of the two recent shares (capture peak, since elite stable
-    # workhorses tend to maintain their share). For Saquon (0.58, 0.55)
-    # that's 0.58, vs the residual-mean's 0.43.
+    raw_games_p1 = usable["games_prior1"].fill_null(0.0).to_numpy()
+
+    # FLOOR 1 — Stable elite. Two consecutive elite seasons → floor at
+    # MAX(prior1, prior2). Captures peak usage for proven workhorses
+    # whose share is stable year-over-year (Saquon, Bijan, Cook,
+    # Henry). Without this, the Ridge model's mean-reversion bias
+    # shrinks them 10-15pp below their actual share.
     stable_mask = (raw_p1 > 0.40) & (raw_p2 > 0.40)
-    stability_floor = np.where(stable_mask, np.maximum(raw_p1, raw_p2), 0.0)
+    stable_floor = np.where(stable_mask, np.maximum(raw_p1, raw_p2), 0.0)
+
+    # FLOOR 2 — Return from injury. When prior1 was games-truncated
+    # (< 10 games, i.e. a season the player missed half or more of)
+    # AND prior2 was elite, anchor on prior2 instead of prior1.
+    # Without this, players returning from injury are projected based
+    # on their depressed injury-shortened share rather than their
+    # actual healthy role. McCaffrey 2024 (4 games, 0.11 share,
+    # prior2=0.55) was projected at ~0.05 share for 2025; his actual
+    # was 0.65. Threshold 10 games = ~60% of season; below that the
+    # truncation noise dominates the share signal.
+    returning_mask = (raw_games_p1 < 10) & (raw_p2 > 0.40)
+    returning_floor = np.where(returning_mask, raw_p2, 0.0)
+
+    floor_bound = stable_mask | returning_mask
+    stability_floor = np.maximum(stable_floor, returning_floor)
     preds = np.maximum(preds, stability_floor)
+    stable_mask = floor_bound  # used below for the floor_bound flag column
 
     return usable.select(
         "player_id", "player_display_name", "position", "season",
@@ -307,6 +350,121 @@ def _predict_share(trained: ShareModel, history: pl.DataFrame) -> pl.DataFrame:
         pl.Series(f"{trained.metric}_pred", preds),
         pl.Series(f"{trained.metric}_floor_bound", stable_mask),
     )
+
+
+def _fit_rush_share_models(
+    history: pl.DataFrame, *, alpha: float = 1.0
+) -> RushShareModel:
+    """
+    Fit a Ridge per modelled position for rush_share.
+
+    Backtest (2023-2025) showed the unified rush_share Ridge loses to
+    a prior1-carry-forward baseline (-10.2% pooled lift) because RB
+    rush_share is a near-random-walk and noise-floor WRs (prior1 ~ 0)
+    pull predictions outside the training distribution. Per-position
+    models on QB and WR-with-prior1 > USAGE_THRESHOLD beat baseline
+    (+1.6% pooled, all 3 seasons). RB and TE rush_share fall back to
+    prior1.
+    """
+    frame = _metric_frame(history, "rush_share")
+    models: dict[str, Ridge] = {}
+    n_train: dict[str, int] = {}
+    train_r2: dict[str, float] = {}
+    for pos in RUSH_SHARE_MODELED_POSITIONS:
+        train = frame.filter(
+            (pl.col("position") == pos)
+            & pl.col("target").is_not_null()
+            & pl.col("prior1").is_not_null()
+            & (pl.col("prior1") > USAGE_THRESHOLD)
+        ).with_columns(
+            pl.col("prior2").fill_null(pl.col("prior1")),
+            pl.col("prior3").fill_null(pl.col("prior1")),
+            pl.col("games_prior1").fill_null(0).cast(pl.Float64),
+            pl.col("years_played").fill_null(1).cast(pl.Float64),
+        ).with_columns(
+            pl.min_horizontal("prior1", "prior2").alias("consistency"),
+        )
+        if train.height < 30:
+            # Insufficient training rows; this position will fall back
+            # to baseline at predict time.
+            continue
+        X = train.select(*FEATURES).to_numpy()
+        y = (train["target"] - train["prior1"]).to_numpy()
+        m = Ridge(alpha=alpha, random_state=0).fit(X, y)
+        models[pos] = m
+        n_train[pos] = train.height
+        train_r2[pos] = float(m.score(X, y))
+    return RushShareModel(
+        models=models,
+        feature_cols=FEATURES,
+        n_train=n_train,
+        train_r2=train_r2,
+    )
+
+
+def _predict_rush_share(
+    trained: RushShareModel, history: pl.DataFrame
+) -> pl.DataFrame:
+    """
+    Per-position predict for rush_share. For positions in
+    ``trained.models`` we apply the Ridge gated at USAGE_THRESHOLD
+    (training distribution support); below-threshold rows and unmodeled
+    positions get pred = prior1. No stability floors — backtest showed
+    the floors hurt rush_share net (the protected workhorses are RBs,
+    which now use the baseline path anyway).
+    """
+    frame = _metric_frame(history, "rush_share")
+    base_pool = frame.filter(
+        pl.col("prior1").is_not_null() & (pl.col("prior1") > 0.0)
+    ).with_columns(
+        pl.col("prior2").fill_null(pl.col("prior1")),
+        pl.col("prior3").fill_null(pl.col("prior1")),
+        pl.col("games_prior1").fill_null(0).cast(pl.Float64),
+        pl.col("years_played").fill_null(1).cast(pl.Float64),
+    ).with_columns(
+        pl.min_horizontal("prior1", "prior2").alias("consistency"),
+    )
+
+    chunks: list[pl.DataFrame] = []
+    routed_to_model: list[pl.Expr] = []  # to anti-join the residual cohort
+
+    for pos, model in trained.models.items():
+        cohort = base_pool.filter(
+            (pl.col("position") == pos) & (pl.col("prior1") > USAGE_THRESHOLD)
+        )
+        routed_to_model.append(
+            (pl.col("position") == pos) & (pl.col("prior1") > USAGE_THRESHOLD)
+        )
+        if cohort.height == 0:
+            continue
+        X = cohort.select(*trained.feature_cols).to_numpy()
+        residuals = model.predict(X)
+        preds = np.clip(cohort["prior1"].to_numpy() + residuals, 0.0, 0.80)
+        chunks.append(cohort.select(
+            "player_id", "player_display_name", "position", "season",
+            pl.col("prior1").alias("rush_share_baseline"),
+        ).with_columns(
+            pl.Series("rush_share_pred", preds),
+            pl.lit(False).alias("rush_share_floor_bound"),
+        ))
+
+    # Everyone not routed to a position model: pred = baseline (prior1).
+    if routed_to_model:
+        routed_mask = routed_to_model[0]
+        for expr in routed_to_model[1:]:
+            routed_mask = routed_mask | expr
+        rest = base_pool.filter(~routed_mask)
+    else:
+        rest = base_pool
+    chunks.append(rest.select(
+        "player_id", "player_display_name", "position", "season",
+        pl.col("prior1").alias("rush_share_baseline"),
+    ).with_columns(
+        pl.col("rush_share_baseline").alias("rush_share_pred"),
+        pl.lit(False).alias("rush_share_floor_bound"),
+    ))
+
+    return pl.concat(chunks, how="vertical")
 
 
 def project_opportunity(
@@ -380,10 +538,10 @@ def project_opportunity(
         pl.cum_count("season").over("player_id").alias("years_played"),
     )
     ts_model = _fit_share_model(history, metric="target_share", alpha=alpha)
-    rs_model = _fit_share_model(history, metric="rush_share", alpha=alpha)
+    rs_model = _fit_rush_share_models(history, alpha=alpha)
 
     ts_pred = _predict_share(ts_model, history)
-    rs_pred = _predict_share(rs_model, history)
+    rs_pred = _predict_rush_share(rs_model, history)
 
     joined = ts_pred.join(
         rs_pred,
