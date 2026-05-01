@@ -56,6 +56,7 @@ import polars as pl
 
 from nfl_proj.backtest.pipeline import BacktestContext
 from nfl_proj.data import loaders
+from nfl_proj.data.college_stats import attach_college_receiving
 from nfl_proj.data.rookie_grades import load_prospect_rankings
 from nfl_proj.data.rookie_matching import match_prospects_to_draft
 
@@ -288,6 +289,37 @@ _STATS_COLS: tuple[str, ...] = (
 )
 
 
+# College-derived efficiency offset (Phase 8c Part 0.6, added 2026-04-30).
+#
+# ``α`` values for the player-specific offset layer applied on top of the
+# cohort-mean cells. For each rookie with college receiving stats, we
+# compute the offset of their college YPR / TD-per-reception from the
+# (position, round_bucket) cohort-mean college metric, then transfer a
+# fraction ``α`` of that offset onto the NFL projection.
+#
+# Empirical calibration on 2019-2025 rookies (n=115 WR/TE with college
+# data) gives OLS-through-origin estimates of α_YPR ≈ 0.28 (R² = 0.08)
+# and α_TD ≈ 0.12. We adopt slightly conservative round numbers below.
+# YPR transfer is the strongest signal; TD-rate transfer is much
+# weaker so we use a smaller multiplier there. Rush efficiency is not
+# personalized (RB college-vs-NFL YPC has near-zero transfer for the
+# small fraction of rookies with sufficient college passing-game data).
+ALPHA_COLLEGE_YPR: float = 0.30
+ALPHA_COLLEGE_TD_PER_REC: float = 0.15
+
+# Minimum sample size (in college receptions) to apply the offset. Below
+# this we use the cohort mean unmodified -- noisy small samples should
+# not override a stable prior.
+MIN_COLLEGE_RECEPTIONS_FOR_OFFSET: int = 20
+
+# Caps on the relative offset to prevent extreme college outliers (e.g.
+# a slot receiver with 8.0 college YPR or a deep WR with 24.0) from
+# yielding unrealistic NFL projections. The cap is applied to the
+# *resulting* NFL YPR adjustment, in absolute units.
+MAX_NFL_YPR_OFFSET: float = 3.0      # ±3.0 yds/reception bump
+MAX_NFL_TD_PER_REC_OFFSET: float = 0.05  # ±5 percentage points
+
+
 Mode = Literal["pre_draft", "post_draft", "auto"]
 
 
@@ -415,7 +447,7 @@ def _historical_rookie_seasons(ctx: BacktestContext) -> pl.DataFrame:
             & (pl.col("season") < ctx.target_season)
             & (pl.col("season") >= 2015)
         )
-        .select("gsis_id", "season", "round", "pick", "position", "team")
+        .select("gsis_id", "season", "round", "pick", "position", "team", "pfr_player_name")
     )
 
     draft_with_tier = _assign_proxy_tiers(draft).rename({"season": "draft_year"})
@@ -431,6 +463,7 @@ def _historical_rookie_seasons(ctx: BacktestContext) -> pl.DataFrame:
             pl.col("rushing_yards").sum().alias("rush_yards"),
             pl.col("receiving_tds").sum().alias("rec_tds"),
             pl.col("rushing_tds").sum().alias("rush_tds"),
+            pl.col("receptions").sum().alias("receptions"),
         )
     )
 
@@ -440,6 +473,57 @@ def _historical_rookie_seasons(ctx: BacktestContext) -> pl.DataFrame:
         right_on=["gsis_id", "draft_year"],
         how="inner",
     )
+
+
+def _college_cohort_means(historical: pl.DataFrame, tgt: int) -> pl.DataFrame:
+    """Per-(position, round_bucket) cohort-mean college receiving metrics.
+
+    Returns a frame with columns:
+        position, round_bucket, cohort_college_ypr, cohort_college_td_per_rec,
+        cohort_n_with_college.
+
+    The cohort means are the prior the per-player offset is computed
+    against: ``offset = player_college_ypr - cohort_college_ypr``. Means
+    are computed only over rookies that *have* college stats attached
+    (i.e. PFF/manual lookup hit) and meet the minimum-receptions filter.
+
+    Cells with ``cohort_n_with_college < 5`` are dropped so we don't pin
+    the offset to a 1-2 player sample. The application code treats a
+    missing cohort row as "no offset available -- fall back to cohort
+    mean" (offset = 0).
+    """
+    recent = (
+        historical
+        .filter(pl.col("season") >= tgt - LOOKBACK_CLASSES)
+        .with_columns(_round_bucket_from_round(pl.col("round")).alias("round_bucket"))
+    )
+    if "college_targets" not in recent.columns:
+        # Caller forgot to attach college stats; return empty so offset
+        # path silently no-ops.
+        return pl.DataFrame(schema={
+            "position": pl.Utf8,
+            "round_bucket": pl.Utf8,
+            "cohort_college_ypr": pl.Float64,
+            "cohort_college_td_per_rec": pl.Float64,
+            "cohort_n_with_college": pl.UInt32,
+        })
+
+    qual = (
+        recent
+        .filter(pl.col("college_receptions").fill_null(0.0) >= MIN_COLLEGE_RECEPTIONS_FOR_OFFSET)
+        .with_columns(
+            (pl.col("college_rec_yards") / pl.col("college_receptions")).alias("_college_ypr"),
+            (pl.col("college_rec_tds") / pl.col("college_receptions")).alias("_college_td_per_rec"),
+        )
+    )
+
+    means = qual.group_by(["position", "round_bucket"]).agg(
+        pl.col("_college_ypr").mean().alias("cohort_college_ypr"),
+        pl.col("_college_td_per_rec").mean().alias("cohort_college_td_per_rec"),
+        pl.len().alias("cohort_n_with_college"),
+    ).filter(pl.col("cohort_n_with_college") >= 5)
+
+    return means
 
 
 def _build_lookup(rookies: pl.DataFrame, tgt: int) -> pl.DataFrame:
@@ -522,7 +606,7 @@ def _project_post_draft(
     ctx: BacktestContext,
     lookup: pl.DataFrame,
     format_key: str,
-) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     tgt = ctx.target_season
 
     # 1. All drafted fantasy rookies for the target season
@@ -583,8 +667,14 @@ def _project_post_draft(
         pl.col("match_method") == "unmatched_rookie"
     )
 
+    # 7. Attach last-college-season receiving stats. Used downstream by
+    #    ``_apply_college_offsets`` to personalize cohort-mean efficiency.
+    rookies = attach_college_receiving(
+        rookies, name_col="pfr_player_name", draft_year_col="season"
+    )
+
     projections = _apply_lookup(rookies, lookup, tgt)
-    return projections, unmatched_prospects_out, unmatched_rookies_out
+    return projections, rookies, unmatched_prospects_out, unmatched_rookies_out
 
 
 # ---------------------------------------------------------------------------
@@ -596,7 +686,7 @@ def _project_pre_draft(
     ctx: BacktestContext,
     lookup: pl.DataFrame,
     format_key: str,
-) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     tgt = ctx.target_season
     # Raises FileNotFoundError if no CSV is on disk for the target
     # season — which is the right behavior in pre-draft mode. Without a
@@ -623,8 +713,12 @@ def _project_pre_draft(
     # against; return an empty frame with the expected schema.
     unmatched_rookies_out = drafted.clear(n=0)
 
+    drafted = attach_college_receiving(
+        drafted, name_col="pfr_player_name", draft_year_col="season"
+    )
+
     projections = _apply_lookup(drafted, lookup, tgt)
-    return projections, unmatched_prospects_out, unmatched_rookies_out
+    return projections, drafted, unmatched_prospects_out, unmatched_rookies_out
 
 
 # ---------------------------------------------------------------------------
@@ -668,6 +762,185 @@ def _apply_lookup(
 
 
 # ---------------------------------------------------------------------------
+# Per-player college-derived efficiency offset (Phase 8c Part 0.6)
+# ---------------------------------------------------------------------------
+
+
+def _apply_college_offsets(
+    projections: pl.DataFrame,
+    rookies_with_college: pl.DataFrame,
+    cohort_means: pl.DataFrame,
+    *,
+    alpha_ypr: float = ALPHA_COLLEGE_YPR,
+    alpha_td: float = ALPHA_COLLEGE_TD_PER_REC,
+) -> pl.DataFrame:
+    """Adjust ``rec_yards_pred`` and ``rec_tds_pred`` by a player-specific
+    college-derived offset.
+
+    The cohort-mean projection from ``_build_lookup`` is treated as the
+    prior. For each rookie we compute:
+
+      ``offset_ypr = α_ypr * (player_college_ypr - cohort_college_ypr)``
+
+    where ``cohort_college_ypr`` is the (position, round_bucket) mean
+    college YPR of historical rookies in the lookup window. The same
+    pattern is applied to ``td_per_rec``.
+
+    The cohort lookup encodes an implicit NFL YPR via
+    ``rec_yards_pred / receptions_pred``. We recover that, add
+    ``offset_ypr``, cap the absolute adjustment, then multiply back
+    by ``receptions_pred`` to get the adjusted ``rec_yards_pred``. The
+    same construction applies to TD rate.
+
+    Rookies without college stats (PFF/manual lookup miss) get an
+    offset of 0 -- the cohort mean stands. Same for rookies whose
+    (position, round_bucket) has fewer than 5 historical rookies with
+    college data (the cohort mean wouldn't be reliable).
+
+    Parameters:
+        projections: post-lookup frame with ``targets_pred``,
+            ``rec_yards_pred``, ``rec_tds_pred``, etc.
+        rookies_with_college: pre-lookup rookie frame carrying the same
+            ``player_id`` + ``round_bucket`` keys as ``projections``,
+            with ``college_targets``, ``college_receptions``,
+            ``college_rec_yards``, ``college_rec_tds`` attached. Names
+            already normalized.
+        cohort_means: per-(position, round_bucket) cohort-mean college
+            metrics; output of ``_college_cohort_means``.
+        alpha_ypr / alpha_td: transfer fractions; see module-level
+            ``ALPHA_*`` constants.
+
+    Returns the projections frame with ``rec_yards_pred`` and
+    ``rec_tds_pred`` adjusted in place. ``rush_yards_pred``,
+    ``rush_tds_pred``, ``targets_pred``, ``carries_pred``,
+    ``games_pred`` are unchanged.
+    """
+    if projections.height == 0 or rookies_with_college.height == 0:
+        return projections
+    if cohort_means.height == 0:
+        return projections
+
+    # Build the per-player offset frame keyed on whatever joins back to
+    # the projection frame. ``player_id`` is the most reliable key
+    # post-draft; pre-draft mode uses ``pfr_player_name`` since
+    # gsis_id is null. Try both.
+    join_keys = ["player_id"] if "player_id" not in projections.columns else ["player_id"]
+    # pre_draft path: gsis_id is null, fall back to player_display_name
+    # We always join on (player_display_name, season) which is unique
+    # within a draft class (every projection row has a distinct display
+    # name and the same season).
+    key_proj = ["player_display_name", "season"]
+    key_rookies = ["pfr_player_name", "season"]
+
+    # Collapse rookies frame to required cols + offset key. ``season``
+    # in the rookies frame is the rookie's NFL year (= draft year);
+    # this matches projections.season.
+    needed_cols = [
+        "pfr_player_name", "season", "position", "round_bucket",
+        "college_receptions", "college_rec_yards", "college_rec_tds",
+    ]
+    missing = [c for c in needed_cols if c not in rookies_with_college.columns]
+    if missing:
+        log.warning(
+            "_apply_college_offsets: rookies_with_college missing %s; "
+            "skipping offset application",
+            missing,
+        )
+        return projections
+
+    rk = rookies_with_college.select(*needed_cols).join(
+        cohort_means, on=["position", "round_bucket"], how="left"
+    ).with_columns(
+        # Player college rates (null when no college data)
+        pl.when(pl.col("college_receptions") >= MIN_COLLEGE_RECEPTIONS_FOR_OFFSET)
+        .then(pl.col("college_rec_yards") / pl.col("college_receptions"))
+        .otherwise(None)
+        .alias("_player_college_ypr"),
+        pl.when(pl.col("college_receptions") >= MIN_COLLEGE_RECEPTIONS_FOR_OFFSET)
+        .then(pl.col("college_rec_tds") / pl.col("college_receptions"))
+        .otherwise(None)
+        .alias("_player_college_td_per_rec"),
+    ).with_columns(
+        # YPR offset: only computed when both player and cohort cells
+        # have data; null otherwise (downstream coalesces to 0).
+        (
+            pl.when(
+                pl.col("_player_college_ypr").is_not_null()
+                & pl.col("cohort_college_ypr").is_not_null()
+            )
+            .then(alpha_ypr * (pl.col("_player_college_ypr") - pl.col("cohort_college_ypr")))
+            .otherwise(0.0)
+            .clip(-MAX_NFL_YPR_OFFSET, MAX_NFL_YPR_OFFSET)
+        ).alias("_ypr_offset"),
+        (
+            pl.when(
+                pl.col("_player_college_td_per_rec").is_not_null()
+                & pl.col("cohort_college_td_per_rec").is_not_null()
+            )
+            .then(alpha_td * (pl.col("_player_college_td_per_rec") - pl.col("cohort_college_td_per_rec")))
+            .otherwise(0.0)
+            .clip(-MAX_NFL_TD_PER_REC_OFFSET, MAX_NFL_TD_PER_REC_OFFSET)
+        ).alias("_td_per_rec_offset"),
+    ).select(
+        pl.col("pfr_player_name").alias("player_display_name"),
+        pl.col("season"),
+        "_ypr_offset",
+        "_td_per_rec_offset",
+    )
+
+    # Some pre-draft rows (or duplicate names) could create a left-join
+    # blow-up; drop dupes keeping the first.
+    rk = rk.unique(subset=["player_display_name", "season"], keep="first")
+
+    proj = projections.join(rk, on=key_proj, how="left").with_columns(
+        pl.col("_ypr_offset").fill_null(0.0),
+        pl.col("_td_per_rec_offset").fill_null(0.0),
+    )
+
+    # Need an estimate of receptions to convert YPR offset to rec_yards
+    # delta. We use the same catch_rate prior the scoring pipeline uses
+    # (CATCH_RATE_BY_POSITION) -- imported lazily to avoid an import
+    # cycle.
+    from nfl_proj.scoring.points import CATCH_RATE_BY_POSITION  # noqa: PLC0415
+
+    cr = pl.DataFrame(
+        {
+            "position": list(CATCH_RATE_BY_POSITION.keys()),
+            "_catch_rate": list(CATCH_RATE_BY_POSITION.values()),
+        }
+    )
+    proj = proj.join(cr, on="position", how="left").with_columns(
+        pl.col("_catch_rate").fill_null(0.5),
+    )
+
+    proj = proj.with_columns(
+        # Adjusted rec_yards = old rec_yards + (YPR_offset * receptions)
+        # where receptions = targets * catch_rate.
+        (
+            pl.col("rec_yards_pred")
+            + pl.col("_ypr_offset") * pl.col("targets_pred") * pl.col("_catch_rate")
+        ).alias("rec_yards_pred"),
+        # Adjusted rec_tds = old rec_tds + (td_per_rec_offset * receptions)
+        (
+            pl.col("rec_tds_pred")
+            + pl.col("_td_per_rec_offset") * pl.col("targets_pred") * pl.col("_catch_rate")
+        )
+        .clip(0.0, None)  # rec_tds can't go negative
+        .alias("rec_tds_pred"),
+    ).drop("_ypr_offset", "_td_per_rec_offset", "_catch_rate")
+
+    n_offset = proj.filter(
+        (pl.col("rec_yards_pred") - projections["rec_yards_pred"]).abs() > 1e-6
+    ).height if "rec_yards_pred" in projections.columns else 0
+    log.info(
+        "_apply_college_offsets: applied college-derived offset to %d / %d "
+        "rookie projections (α_ypr=%.2f, α_td=%.2f)",
+        n_offset, proj.height, alpha_ypr, alpha_td,
+    )
+    return proj
+
+
+# ---------------------------------------------------------------------------
 # Public entrypoint
 # ---------------------------------------------------------------------------
 
@@ -698,6 +971,14 @@ def project_rookies(
     hist = _historical_rookie_seasons(ctx)
     lookup = _build_lookup(hist, ctx.target_season)
 
+    # Attach college receiving stats to historical rookies so we can
+    # compute (position, round_bucket) cohort-mean college metrics that
+    # zero-center the per-player offset.
+    hist_with_college = attach_college_receiving(
+        hist, name_col="pfr_player_name", draft_year_col="season"
+    )
+    cohort_means = _college_cohort_means(hist_with_college, ctx.target_season)
+
     if mode == "auto":
         has_draft = (
             loaders.load_draft_picks()
@@ -708,9 +989,14 @@ def project_rookies(
         mode = "post_draft" if has_draft else "pre_draft"
 
     if mode == "post_draft":
-        proj, un_p, un_r = _project_post_draft(ctx, lookup, format_key)
+        proj, rookies_with_college, un_p, un_r = _project_post_draft(ctx, lookup, format_key)
     else:
-        proj, un_p, un_r = _project_pre_draft(ctx, lookup, format_key)
+        proj, rookies_with_college, un_p, un_r = _project_pre_draft(ctx, lookup, format_key)
+
+    # Apply the player-specific college-derived efficiency offset on top
+    # of the cohort-mean projection. Rookies without college stats keep
+    # the cohort mean unchanged (offset = 0).
+    proj = _apply_college_offsets(proj, rookies_with_college, cohort_means)
 
     # Enrich null player_id / team rows (typical for the freshly-drafted
     # class before nflreadpy ingests it). See module docstring above
