@@ -52,6 +52,46 @@ def _normalise_team(col: str) -> pl.Expr:
     return expr
 
 
+def _synthetic_target_schedule(
+    schedules: pl.DataFrame, target_season: int
+) -> pl.DataFrame:
+    """
+    When the target-season schedule isn't released yet (early-spring
+    projections), build a placeholder schedule by reusing the prior
+    season's matchups: each team plays the 17 opponents they played
+    last year, same home/away split.
+
+    Accuracy: ~60-70% of opponents repeat year-over-year (all 6
+    division games always do; the rotating-division and
+    standings-based games swap). For the season-aggregate mean
+    point-diff signal that play_calling consumes, that's close
+    enough to activate the gamescript path before the real schedule
+    drops in mid-May.
+
+    Returns a frame matching the schema of ``schedules.filter(season==tgt)``
+    with synthetic ``game_id``s, ``week`` set to null, ``gameday`` to
+    null, and ``home_score``/``away_score`` to null.
+    """
+    prior = schedules.filter(
+        (pl.col("season") == target_season - 1)
+        & (pl.col("game_type") == "REG")
+    )
+    if prior.height == 0:
+        return prior.head(0)  # empty — propagates as no signal
+    syn = prior.with_columns(
+        pl.lit(target_season).cast(prior.schema["season"]).alias("season"),
+        pl.lit(None).cast(prior.schema["week"]).alias("week"),
+        pl.lit(None).cast(prior.schema["gameday"]).alias("gameday"),
+        pl.lit(None).cast(prior.schema["home_score"]).alias("home_score"),
+        pl.lit(None).cast(prior.schema["away_score"]).alias("away_score"),
+        # Synthetic game_id so it doesn't collide with real ids.
+        (
+            pl.lit(f"SYN_{target_season}_") + pl.col("game_id").cast(pl.String)
+        ).alias("game_id"),
+    )
+    return syn
+
+
 def project_gamescript(
     ctx: BacktestContext,
     *,
@@ -63,6 +103,11 @@ def project_gamescript(
 
     ``team_result`` can be passed in to reuse Phase 1 output (expensive to
     recompute); otherwise we run it.
+
+    When the target-season schedule isn't released yet (e.g. April-May
+    projections for the upcoming season), falls back to a synthetic
+    schedule built from the prior year's matchups. See
+    ``_synthetic_target_schedule``.
     """
     if team_result is None:
         team_result = project_team_season(ctx)
@@ -81,10 +126,14 @@ def project_gamescript(
     league_off = team_preds["ppg_off_pred"].mean()
     league_def = team_preds["ppg_def_pred"].mean()
 
-    # Pull target-season regular-season schedule.
-    sched = ctx.schedules.filter(
+    # Pull target-season regular-season schedule. If empty, fall back
+    # to a synthetic schedule from the prior year's matchups.
+    raw_sched = ctx.schedules.filter(
         (pl.col("season") == tgt) & (pl.col("game_type") == "REG")
-    ).select(
+    )
+    if raw_sched.height == 0:
+        raw_sched = _synthetic_target_schedule(ctx.schedules, tgt)
+    sched = raw_sched.select(
         "game_id",
         "season",
         "week",

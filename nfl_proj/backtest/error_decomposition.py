@@ -208,7 +208,9 @@ def run_season_decomposition(season: int) -> SeasonDecomp:
     # Build every phase once.
     team = project_team_season(ctx)
     gamescript = project_gamescript(ctx, team_result=team)
-    pc = project_play_calling(ctx, team_result=team)
+    pc = project_play_calling(
+        ctx, team_result=team, gamescript_games=gamescript.games
+    )
     opp = project_opportunity(ctx)
     eff = project_efficiency(ctx)
     avail = project_availability(ctx)

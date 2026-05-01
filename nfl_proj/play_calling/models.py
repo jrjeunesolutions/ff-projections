@@ -82,12 +82,76 @@ FEATURES: tuple[str, ...] = (
     "wins_pred",
     "coach_changed",
     "league_prior1",
+    "mean_margin",  # 2026-04-30: schedule-aware game-script signal.
+                    # Historical = actual season mean point diff.
+                    # Target = projected mean from Phase 2 gamescript
+                    # (per-game point_diff_pred, averaged across the
+                    # team's 17 scheduled games). Empirical β ≈ 0.0025
+                    # per point of trailing — Ridge will pick this up.
 )
+
+
+def _team_season_mean_margin(
+    ctx: BacktestContext,
+    target_season: int,
+    gamescript_games: pl.DataFrame | None = None,
+) -> pl.DataFrame:
+    """
+    Compute per (team, season) mean point differential.
+
+    Historical seasons use ACTUAL margins from completed games in
+    ``ctx.schedules``. The target season uses PROJECTED margins from
+    Phase 2 ``gamescript_games`` (per-game ``point_diff_pred``,
+    flipped for away teams) when available — otherwise the target
+    season is omitted (callers should fill_null with 0.0 / league mean).
+
+    Returns: (team, season, mean_margin)
+    """
+    sched = ctx.schedules.filter(pl.col("game_type") == "REG")
+    # Historical: use actual scores, drop unfinished games.
+    hist = sched.filter(
+        pl.col("home_score").is_not_null() & pl.col("away_score").is_not_null()
+    )
+    home = hist.select(
+        pl.col("home_team").alias("team"), "season",
+        (pl.col("home_score") - pl.col("away_score")).cast(pl.Float64).alias("margin"),
+    )
+    away = hist.select(
+        pl.col("away_team").alias("team"), "season",
+        (pl.col("away_score") - pl.col("home_score")).cast(pl.Float64).alias("margin"),
+    )
+    actual = pl.concat([home, away]).group_by(["team", "season"]).agg(
+        pl.col("margin").mean().alias("mean_margin"),
+    )
+    # Drop the partial-season actual for the target year (we use projected
+    # instead) and any season where most games are missing.
+    actual = actual.filter(pl.col("season") < target_season)
+
+    chunks = [actual]
+    if gamescript_games is not None and gamescript_games.height > 0:
+        # Projected margins for the target season. point_diff_pred = home -
+        # away, so flip for away teams.
+        gs_home = gamescript_games.select(
+            pl.col("home_team").alias("team"),
+            pl.lit(target_season).cast(pl.Int32).alias("season"),
+            pl.col("point_diff_pred").alias("margin"),
+        )
+        gs_away = gamescript_games.select(
+            pl.col("away_team").alias("team"),
+            pl.lit(target_season).cast(pl.Int32).alias("season"),
+            (-pl.col("point_diff_pred")).alias("margin"),
+        )
+        projected = pl.concat([gs_home, gs_away]).group_by(["team", "season"]).agg(
+            pl.col("margin").mean().alias("mean_margin"),
+        )
+        chunks.append(projected)
+    return pl.concat(chunks, how="vertical").sort(["team", "season"])
 
 
 def _build_feature_frame(
     ctx: BacktestContext,
     team_result: TeamProjection,
+    gamescript_games: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """
     Build the (team, season) pass-rate feature frame over the full history
@@ -169,6 +233,17 @@ def _build_feature_frame(
     pr = pr.join(team_info, on=["team", "season"], how="left")
     pr = pr.join(ts, on=["team", "season"], how="left")
 
+    # Game-script feature: per (team, season) mean point differential.
+    # Historical = actual; target season = projected from gamescript.
+    margins = _team_season_mean_margin(ctx, tgt, gamescript_games)
+    pr = pr.join(margins, on=["team", "season"], how="left")
+    # Fill null mean_margin with 0.0 (league-neutral). This handles:
+    # - Target season when gamescript is unavailable (e.g. schedule
+    #   not yet released): treat as neutral, model falls back to
+    #   prior-only prediction.
+    # - Pre-2015 era seasons that may be missing schedule entries.
+    pr = pr.with_columns(pl.col("mean_margin").fill_null(0.0))
+
     # Baseline: just prior1 (persistence).
     pr = pr.with_columns(pl.col("prior1").alias("pass_rate_baseline"))
     return pr
@@ -231,10 +306,23 @@ def project_play_calling(
     *,
     team_result: TeamProjection | None = None,
     alpha: float = 1.0,
+    gamescript_games: pl.DataFrame | None = None,
 ) -> PlayCallingProjection:
+    """
+    Phase 3 pass-rate projection.
+
+    ``gamescript_games``: optional Phase 2 gamescript output
+    (``GamescriptProjection.games``). When provided, the per-team
+    mean projected point differential is added as a feature to the
+    Ridge — letting the model account for projected game script
+    (heavy underdogs pass more, dominant favorites run more). When
+    omitted (e.g. target-season schedule not yet released), the
+    feature falls back to 0.0 (league-neutral) and the prediction
+    reduces to the prior-only path.
+    """
     if team_result is None:
         team_result = project_team_season(ctx)
-    frame = _build_feature_frame(ctx, team_result)
+    frame = _build_feature_frame(ctx, team_result, gamescript_games)
     trained = fit_pass_rate_model(frame, alpha=alpha)
     preds = predict_pass_rate(trained, frame)
     target = preds.filter(pl.col("season") == ctx.target_season).sort("team")

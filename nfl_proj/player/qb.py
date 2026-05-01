@@ -239,7 +239,23 @@ def _project_qb_rates(
         .group_by("player_id", maintain_order=True)
         .head(3)
     )
-    rolled = last3.group_by("player_id", maintain_order=True).agg(
+    # Per-season qb_share + a "starter weight" so backup-year shares
+    # don't contaminate the rollup. Backup-year share is 5-10%, starter
+    # share is 90%+. Simple sum-then-divide blends them via team_qb_attempts
+    # (which is full whether or not the player started), so a backup year
+    # is mathematically equivalent to a 90pp share penalty. Fix: weight
+    # each season by min(1, pass_attempts / 200) so a full starter year
+    # gets weight 1.0 and a 50-attempt backup year gets weight 0.25.
+    last3_with_share = last3.with_columns(
+        (
+            pl.col("pass_attempts") / pl.col("team_qb_attempts").clip(1)
+        ).alias("season_qb_share"),
+        pl.min_horizontal(
+            pl.lit(1.0),
+            pl.col("pass_attempts").cast(pl.Float64) / 200.0,
+        ).alias("starter_weight"),
+    )
+    rolled = last3_with_share.group_by("player_id", maintain_order=True).agg(
         pl.col("player_display_name").last(),
         pl.col("pass_attempts").sum().alias("att_sum"),
         pl.col("completions").sum().alias("comp_sum"),
@@ -251,6 +267,14 @@ def _project_qb_rates(
         pl.col("rush_tds").sum().alias("rtd_sum"),
         pl.col("games").sum().alias("games_sum"),
         pl.col("team_qb_attempts").sum().alias("team_att_sum"),
+        # Starter-weighted average of per-season qb_share. Falls back
+        # to plain att_sum/team_att_sum when no season had ≥1 starter
+        # weight (everyone was a deep backup).
+        (
+            (pl.col("season_qb_share") * pl.col("starter_weight")).sum()
+            / pl.col("starter_weight").sum().clip(1e-6)
+        ).alias("qb_share_starter_weighted"),
+        pl.col("starter_weight").sum().alias("starter_weight_sum"),
     )
 
     rolled = rolled.with_columns(
@@ -270,7 +294,17 @@ def _project_qb_rates(
             .then(pl.col("rtd_sum") / pl.col("ra_sum"))
             .otherwise(means["rush_td_rate"])
         ).alias("rtd_rate_raw"),
-        (pl.col("att_sum") / pl.col("team_att_sum").clip(1)).alias("qb_share_raw"),
+        # qb_share_raw uses the starter-weighted version when at least
+        # one season had meaningful starter time; otherwise falls back
+        # to the plain att_sum/team_att_sum (which is fine for a player
+        # whose last 3 seasons are all backup roles — the shrinkage to
+        # league mean will dominate anyway).
+        pl.when(pl.col("starter_weight_sum") > 0.5)
+        .then(pl.col("qb_share_starter_weighted"))
+        .otherwise(
+            pl.col("att_sum") / pl.col("team_att_sum").clip(1)
+        )
+        .alias("qb_share_raw"),
     )
 
     # Shrunk rates
@@ -329,26 +363,69 @@ def _current_roster_qbs(ctx: BacktestContext) -> pl.DataFrame:
     Used to reject retired players like Brady / Ryan / Rivers / Luck
     who otherwise pass the "≥50 attempts in last two seasons" filter
     via their last playing season.
+
+    Also pulls the *live* nflreadpy roster for ``ctx.target_season``
+    when available (the as_of-filtered ``ctx.rosters`` is conservative
+    and lags by a season). Players with status=UFA/RFA on the live
+    target-year roster are dropped — without this gate, released
+    veterans (Aaron Rodgers PIT 2026 UFA) keep getting projected on
+    their last team via the prior-annual fallback in
+    ``team_assignments_as_of``.
     """
     tgt = ctx.target_season
     rosters = ctx.rosters
-    if rosters.height == 0 or "season" not in rosters.columns:
-        return pl.DataFrame({"player_id": []}, schema={"player_id": pl.String})
 
-    # Prefer current-year rows; fall back to tgt-1 if the current-year
-    # annual roster isn't in the as-of-filtered snapshot.
-    current = rosters.filter(
-        (pl.col("season") == tgt) & (pl.col("position") == "QB")
-    )
-    if current.height == 0:
-        current = rosters.filter(
-            (pl.col("season") == tgt - 1) & (pl.col("position") == "QB")
-        )
+    # Source A — as_of-filtered annual rosters (historical-safe).
+    qb_ids: set[str] = set()
+    if rosters.height > 0 and "season" in rosters.columns:
+        has_status = "status" in rosters.columns
+        for season_pref in (tgt, tgt - 1):
+            current = rosters.filter(
+                (pl.col("season") == season_pref) & (pl.col("position") == "QB")
+            )
+            if has_status:
+                current = current.filter(~pl.col("status").is_in(["UFA", "RFA"]))
+            if current.height > 0:
+                id_col = "gsis_id" if "gsis_id" in current.columns else "player_id"
+                qb_ids |= set(
+                    current.select(pl.col(id_col).alias("pid"))
+                    .drop_nulls()
+                    .get_column("pid")
+                    .to_list()
+                )
+                break
 
-    # Column name varies across nflreadpy versions — prefer gsis_id if present.
-    id_col = "gsis_id" if "gsis_id" in current.columns else "player_id"
-    ids = current.select(pl.col(id_col).alias("player_id")).drop_nulls().unique()
-    return ids
+    # Source B — live nflreadpy target-year roster, status-filtered.
+    # The as_of conservative filter excludes the target-year annual
+    # roster, but the player-team assignments (manual CSV / weekly /
+    # annual via _rosters_all) bypass that conservatism. To stay
+    # consistent, we filter UFAs against the same target-year live
+    # source the team_assignment helper uses.
+    try:
+        import nflreadpy as nfl
+        live = nfl.load_rosters(seasons=[tgt])
+        if live.height > 0:
+            qb_live = live.filter(pl.col("position") == "QB")
+            if "status" in qb_live.columns:
+                qb_live = qb_live.filter(~pl.col("status").is_in(["UFA", "RFA"]))
+            id_col = "gsis_id" if "gsis_id" in qb_live.columns else "player_id"
+            live_ids = set(
+                qb_live.select(pl.col(id_col).alias("pid"))
+                .drop_nulls()
+                .get_column("pid")
+                .to_list()
+            )
+            # Intersect: a player must be (a) in the historical roster
+            # gate AND (b) not UFA on the live target-year roster.
+            # If live is non-empty, restrict to those who appear in it
+            # OR who weren't yet listed (e.g. just-signed mid-season
+            # additions still get the historical-only gate).
+            qb_ids &= live_ids
+    except Exception:
+        # Live roster fetch failed — keep historical-only gate.
+        pass
+
+    return pl.DataFrame({"player_id": sorted(qb_ids)}, schema={"player_id": pl.String})
 
 
 # ---------------------------------------------------------------------------
