@@ -260,10 +260,18 @@ def _veteran_counting_stats(
     qb/rookies are None.
     """
     # Source frames
-    opp_f = opp.projections.select(
-        "player_id", "player_display_name", "position",
-        "target_share_pred", "rush_share_pred",
-    )
+    # Pull floor-bound flags from the opportunity model: True when the
+    # player's recent (prior1, prior2) shares both exceeded 0.40 (elite
+    # stable workhorse). Used below in the team normalization to PROTECT
+    # those shares from being diluted by backups whose priors come
+    # from being primary on prior teams.
+    opp_cols = ["player_id", "player_display_name", "position",
+                "target_share_pred", "rush_share_pred"]
+    if "target_share_floor_bound" in opp.projections.columns:
+        opp_cols.append("target_share_floor_bound")
+    if "rush_share_floor_bound" in opp.projections.columns:
+        opp_cols.append("rush_share_floor_bound")
+    opp_f = opp.projections.select(opp_cols)
     eff_f = eff.projections.select(
         "player_id",
         "yards_per_target_pred", "yards_per_carry_pred",
@@ -349,18 +357,19 @@ def _veteran_counting_stats(
                 ~pl.col("player_id").is_in(rookie_pipeline_ids)
             )
 
-    # QB + rookie partitioning: subtract per-team QB rush attempts and
-    # rookie targets/carries from team volumes so veteran shares only
-    # allocate what's left. Without this step:
-    #   * mobile-QB teams (HOU/KC/TEN/SEA/WAS) over-attribute rushes by
-    #     ~10-25% (the QB rush volume that's added on top in
-    #     ``_qb_counting_stats``);
-    #   * rookie-heavy teams (ARI w/ Jeremiyah Love, JAX w/ Tuten,
-    #     LV w/ Mendoza) over-attribute by the rookie absolute totals
-    #     from ``project_rookies``, which bypass veteran share
-    #     normalization.
-    # team_vol is mutated to carry the partitioned ``team_targets`` /
-    # ``team_carries`` columns from here on.
+    # QB + rookie partitioning: compute per-team "vet-pool target ratio"
+    # = 1 - qb_share - rookie_share. Vet shares should sum to this
+    # fraction of team_carries / team_targets (not 1.0), so that
+    # vet + qb + rookie totals = team volume exactly. We carry
+    # ``vet_target_targets`` / ``vet_target_carries`` columns through
+    # team_vol; the share normalization below uses these to scale.
+    #
+    # The original team_targets / team_carries are PRESERVED — we apply
+    # vet_share to original team_carries (not residual), with the share
+    # NORMALIZED to sum to vet_target_ratio. This preserves the semantics
+    # that prior1 (=share-of-total team carries) is applied at the
+    # right scale, instead of being mis-applied to a smaller residual
+    # which under-attributes proven workhorses.
     if qb is not None and qb.qbs.height > 0:
         team_qb_rush = (
             qb.qbs.group_by("team")
@@ -369,14 +378,9 @@ def _veteran_counting_stats(
         team_vol = (
             team_vol.join(team_qb_rush, on="team", how="left")
             .with_columns(pl.col("team_qb_carries").fill_null(0.0))
-            .with_columns(
-                pl.max_horizontal(
-                    pl.col("team_carries") - pl.col("team_qb_carries"),
-                    pl.lit(0.0),
-                ).alias("team_carries")
-            )
-            .drop("team_qb_carries")
         )
+    else:
+        team_vol = team_vol.with_columns(pl.lit(0.0).alias("team_qb_carries"))
 
     if rookies is not None and rookies.projections.height > 0:
         rk = rookies.projections.filter(pl.col("team").is_not_null())
@@ -391,18 +395,40 @@ def _veteran_counting_stats(
                     pl.col("team_rookie_targets").fill_null(0.0),
                     pl.col("team_rookie_carries").fill_null(0.0),
                 )
-                .with_columns(
-                    pl.max_horizontal(
-                        pl.col("team_targets") - pl.col("team_rookie_targets"),
-                        pl.lit(0.0),
-                    ).alias("team_targets"),
-                    pl.max_horizontal(
-                        pl.col("team_carries") - pl.col("team_rookie_carries"),
-                        pl.lit(0.0),
-                    ).alias("team_carries"),
-                )
-                .drop(["team_rookie_targets", "team_rookie_carries"])
             )
+        else:
+            team_vol = team_vol.with_columns(
+                pl.lit(0.0).alias("team_rookie_targets"),
+                pl.lit(0.0).alias("team_rookie_carries"),
+            )
+    else:
+        team_vol = team_vol.with_columns(
+            pl.lit(0.0).alias("team_rookie_targets"),
+            pl.lit(0.0).alias("team_rookie_carries"),
+        )
+
+    # Vet pool target ratios: fraction of team volume the vet pool
+    # should claim. Clamped to ≥ 0 (rare edge case where qb+rookie
+    # would over-claim on weird snapshots).
+    team_vol = team_vol.with_columns(
+        pl.max_horizontal(
+            (
+                1.0
+                - pl.col("team_qb_carries") / pl.col("team_carries")
+                - pl.col("team_rookie_carries") / pl.col("team_carries")
+            ),
+            pl.lit(0.0),
+        ).alias("vet_target_ratio_carries"),
+        pl.max_horizontal(
+            (
+                1.0
+                - pl.col("team_rookie_targets") / pl.col("team_targets")
+            ),
+            pl.lit(0.0),
+        ).alias("vet_target_ratio_targets"),
+    ).drop([
+        "team_qb_carries", "team_rookie_carries", "team_rookie_targets",
+    ])
 
     merged = merged.join(team_vol, on="team", how="left")
 
@@ -425,55 +451,132 @@ def _veteran_counting_stats(
     )
 
     # PER-TEAM AVAILABILITY-WEIGHTED SHARE NORMALIZATION
-    # (added 2026-04-30, revised 2026-04-30):
+    # (added 2026-04-30, revised 2026-04-30 v3):
     #
     # The share model predicts each player's share independently using
     # their *prior team's* historical context, then we re-attribute them
-    # to their as_of team. Two corrections happen here in one pass:
+    # to their as_of team. Three things happen here in one pass:
     #
-    #   (1) Per-team share renormalization (original v1):
-    #       Without it, predicted shares per team sum anywhere from 50%
-    #       (rookie-heavy thin teams) to 132% (offseason-roster-shuffle
-    #       teams). Renormalizing makes per-team share sum exactly 1.0.
+    #   (1) ELITE PROTECTION (new in v3):
+    #       Players whose opportunity-model prediction was floor-bound
+    #       (proven elite usage 2 years running, e.g. Saquon, Bijan,
+    #       Cook, Henry, McCaffrey) keep their predicted weight FIXED.
+    #       Without this, backups whose priors come from being primary
+    #       on a different team (e.g. Bigsby's 0.14 prior from JAX, or
+    #       Gainwell's 0.18 from earlier PHI years) eat into the lead
+    #       back's share when the team-share normalization scales
+    #       everyone proportionally. Result: PHI Saquon was projected at
+    #       172 carries vs his real-world 280-345 range. With elite
+    #       protection, the backup pool fills the residual instead.
     #
-    #   (2) Availability-weighted redistribution (new 2026-04-30 v2):
-    #       Multiplying share × games_scalar AFTER normalization gives
-    #       team totals well below team_volume because games_scalar < 1
-    #       drags every player's projection down. Real-life NFL doesn't
-    #       work that way: when the starter misses 3 games, his carries
-    #       go to the BACKUP, not vanish. This redistribution is what
-    #       was producing the 60-87% rush coverage.
+    #   (2) AVAILABILITY-WEIGHTED REDISTRIBUTION:
+    #       Each player's weight = share × games_scalar, so a starter
+    #       missing 3 games gives those carries to teammates (the way
+    #       real depth charts work) rather than vanishing as missing
+    #       volume. Drives team coverage from 75% → ~100%.
     #
-    #       Fix: define each player's weight as (share × games_scalar)
-    #       and normalize the WEIGHTS to sum to 1.0 per team. Healthy
-    #       teammates pick up the slack of injured ones in proportion to
-    #       their predicted shares. After this, per-team Σ(targets_pred)
-    #       = team_targets and Σ(carries_pred) = team_carries (exactly,
-    #       up to floating point) — the residual volume after QB+rookie
-    #       partitioning is fully attributed to vets.
+    #   (3) TEAM-VOLUME EXACT MATCH:
+    #       Per-team Σ(weights) = 1.0 exactly, so per-team Σ(targets_pred)
+    #       = team_targets and Σ(carries_pred) = team_carries.
+    elite_t = "target_share_floor_bound" in merged.columns
+    elite_r = "rush_share_floor_bound" in merged.columns
+    if not elite_t:
+        merged = merged.with_columns(pl.lit(False).alias("target_share_floor_bound"))
+    if not elite_r:
+        merged = merged.with_columns(pl.lit(False).alias("rush_share_floor_bound"))
+
     merged = merged.with_columns(
         (pl.col("target_share_pred") * pl.col("games_scalar")).alias("_t_w"),
         (pl.col("rush_share_pred") * pl.col("games_scalar")).alias("_r_w"),
     )
-    team_weights = merged.group_by("team").agg(
-        pl.col("_t_w").sum().alias("_team_t_w"),
-        pl.col("_r_w").sum().alias("_team_r_w"),
+    # Per-team aggregates split by elite/non-elite for the protection
+    # logic. "_e" suffix = sum across floor-bound players, "_n" suffix
+    # = sum across non-floor-bound. The arithmetic below relies on the
+    # invariant ``_e + _n = total team weight``.
+    team_aggs = merged.group_by("team").agg(
+        pl.col("_t_w").filter(pl.col("target_share_floor_bound"))
+          .sum().alias("_t_e"),
+        pl.col("_t_w").filter(~pl.col("target_share_floor_bound"))
+          .sum().alias("_t_n"),
+        pl.col("_r_w").filter(pl.col("rush_share_floor_bound"))
+          .sum().alias("_r_e"),
+        pl.col("_r_w").filter(~pl.col("rush_share_floor_bound"))
+          .sum().alias("_r_n"),
     )
-    merged = merged.join(team_weights, on="team", how="left")
+    merged = merged.join(team_aggs, on="team", how="left")
+
+    # Normalized weight per player. Target sum per team is
+    # ``vet_target_ratio`` (= 1 - qb_share - rookie_share for carries,
+    # 1 - rookie_share for targets). This is the fraction of total
+    # team volume that the vet pool should claim.
+    #
+    #   * If elite floor-binding for this metric:
+    #       - When elite weight sum ≥ vet_target: scale elites to sum
+    #         to vet_target, non-elites get 0 (rare; would mean two
+    #         max-share players on one team).
+    #       - Else: the elite player keeps their weight unchanged
+    #         (CRITICAL — this is what protects Saquon's 0.58 share
+    #         from being diluted to 0.43 by Bigsby/Steele/etc. priors).
+    #   * If non-elite:
+    #       - When elite weight sum ≥ vet_target: weight → 0.
+    #       - Else: scale to fill (vet_target - elite_sum).
+    #
+    # Final result: Σ(normalized_weight) per team = vet_target_ratio,
+    # so vets claim vet_target × team_carries = team_carries - qb_carries
+    # - rookie_carries; total team carries = vets + qbs + rookies =
+    # team_carries exactly.
     merged = merged.with_columns(
-        (
-            pl.col("team_targets")
-            * pl.when(pl.col("_team_t_w") > 0)
-              .then(pl.col("_t_w") / pl.col("_team_t_w"))
-              .otherwise(0.0)
-        ).alias("targets_pred"),
-        (
-            pl.col("team_carries")
-            * pl.when(pl.col("_team_r_w") > 0)
-              .then(pl.col("_r_w") / pl.col("_team_r_w"))
-              .otherwise(0.0)
-        ).alias("carries_pred"),
-    ).drop(["_t_w", "_r_w", "_team_t_w", "_team_r_w"])
+        # Targets
+        pl.when(pl.col("target_share_floor_bound"))
+          .then(
+              pl.when(pl.col("_t_e") >= pl.col("vet_target_ratio_targets"))
+                .then(
+                    pl.col("_t_w") * pl.col("vet_target_ratio_targets")
+                    / pl.col("_t_e")
+                )
+                .otherwise(pl.col("_t_w"))
+          )
+          .otherwise(
+              pl.when(pl.col("_t_e") >= pl.col("vet_target_ratio_targets"))
+                .then(pl.lit(0.0))
+                .when(pl.col("_t_n") > 0)
+                .then(
+                    pl.col("_t_w")
+                    * (pl.col("vet_target_ratio_targets") - pl.col("_t_e"))
+                    / pl.col("_t_n")
+                )
+                .otherwise(pl.lit(0.0))
+          ).alias("_t_norm"),
+        # Carries
+        pl.when(pl.col("rush_share_floor_bound"))
+          .then(
+              pl.when(pl.col("_r_e") >= pl.col("vet_target_ratio_carries"))
+                .then(
+                    pl.col("_r_w") * pl.col("vet_target_ratio_carries")
+                    / pl.col("_r_e")
+                )
+                .otherwise(pl.col("_r_w"))
+          )
+          .otherwise(
+              pl.when(pl.col("_r_e") >= pl.col("vet_target_ratio_carries"))
+                .then(pl.lit(0.0))
+                .when(pl.col("_r_n") > 0)
+                .then(
+                    pl.col("_r_w")
+                    * (pl.col("vet_target_ratio_carries") - pl.col("_r_e"))
+                    / pl.col("_r_n")
+                )
+                .otherwise(pl.lit(0.0))
+          ).alias("_r_norm"),
+    )
+    merged = merged.with_columns(
+        (pl.col("team_targets") * pl.col("_t_norm")).alias("targets_pred"),
+        (pl.col("team_carries") * pl.col("_r_norm")).alias("carries_pred"),
+    ).drop([
+        "_t_w", "_r_w", "_t_e", "_t_n", "_r_e", "_r_n", "_t_norm", "_r_norm",
+        "target_share_floor_bound", "rush_share_floor_bound",
+        "vet_target_ratio_targets", "vet_target_ratio_carries",
+    ])
 
     # Catch rate lookup
     cr = pl.DataFrame(

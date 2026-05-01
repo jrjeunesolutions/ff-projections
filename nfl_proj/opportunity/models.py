@@ -262,11 +262,51 @@ def _predict_share(trained: ShareModel, history: pl.DataFrame) -> pl.DataFrame:
     X = usable.select(*trained.feature_cols).to_numpy()
     residuals = trained.model.predict(X)
     base = usable["prior1"].to_numpy()
-    preds = np.clip(base + residuals, 0.0, 0.50)  # clip to plausible range
+    preds = np.clip(base + residuals, 0.0, 0.80)  # clip to plausible range
+
+    # STABILITY FLOOR (added 2026-04-30):
+    #
+    # The Ridge residual model trained on (target - prior1) has strongly
+    # negative coefficients on prior1 (~ -0.43), games_prior1 (~ -0.003),
+    # and years_played (~ -0.005). Net effect: it aggressively mean-reverts
+    # ALL elite shares toward the population mean, including for proven
+    # workhorses who have demonstrably stable elite usage year over year.
+    #
+    # Concrete miss: Saquon Barkley's 2026 prior1 = 0.580 (his 2025 share),
+    # prior2 = 0.555, prior3 = 0.545 — four straight elite seasons. The
+    # Ridge model predicts 0.428 (a -15pp drop) because it averages over
+    # the population's mean-reversion behavior. Bijan, Cook, etc. show
+    # the same pattern.
+    #
+    # Floor: when a player's two most recent shares are BOTH above 0.40,
+    # we floor the prediction at min(prior1, prior2). This treats two
+    # consecutive elite seasons as evidence of a stable role and prevents
+    # the model from shrinking it. Backups with a transient high share
+    # in one year don't trigger the floor (their prior2 is below 0.40
+    # almost by construction).
+    #
+    # Threshold 0.40 is conservative: any RB sustaining 40%+ rush share
+    # for two seasons in a row is a clear lead back. Same for receivers
+    # at 20%+ target share — but for symmetry we use the same 0.40 floor;
+    # most WR1s top out around 0.30, so the floor naturally won't fire
+    # on WRs.
+    raw_p1 = usable["prior1"].to_numpy()
+    raw_p2 = usable.get_column("prior2").fill_null(0.0).to_numpy()
+    # Stable: at least two consecutive elite seasons. Floor at the
+    # MAX of the two recent shares (capture peak, since elite stable
+    # workhorses tend to maintain their share). For Saquon (0.58, 0.55)
+    # that's 0.58, vs the residual-mean's 0.43.
+    stable_mask = (raw_p1 > 0.40) & (raw_p2 > 0.40)
+    stability_floor = np.where(stable_mask, np.maximum(raw_p1, raw_p2), 0.0)
+    preds = np.maximum(preds, stability_floor)
+
     return usable.select(
         "player_id", "player_display_name", "position", "season",
         pl.col("prior1").alias(f"{trained.metric}_baseline"),
-    ).with_columns(pl.Series(f"{trained.metric}_pred", preds))
+    ).with_columns(
+        pl.Series(f"{trained.metric}_pred", preds),
+        pl.Series(f"{trained.metric}_floor_bound", stable_mask),
+    )
 
 
 def project_opportunity(
