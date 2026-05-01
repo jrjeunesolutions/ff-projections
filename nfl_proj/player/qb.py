@@ -719,7 +719,50 @@ def project_qb(
     # projection (very thin history).
     merged = merged.with_columns(
         pl.col("games_pred").fill_null(float(SEASON_GAMES)),
-    ).with_columns(
+    )
+
+    # LIVE-MODE-ONLY depth-chart-1 QB games floor (added 2026-05-01):
+    # Mirrors apply_lead_starter_games_floor for skill positions but
+    # applied here in the QB module so it fires BEFORE pass_attempts_pred
+    # is computed (downstream pass_attempts = team_att × qb_share ×
+    # games_scalar; if we floor games_pred only after, the volume math
+    # is locked at the lower games count). Concrete fix: Jayden Daniels
+    # (depth-chart QB1 on WAS) had games_pred=10.7 after his 7-game
+    # 2025 dragged the recency-weighted availability mean down. Floor
+    # at 15.5 (typical healthy QB1 games) lifts him to projected
+    # full-season volume. Same gating as the rest of the depth-chart
+    # override system: target_season > today.year - 1.
+    from datetime import date as _date_qb
+    if ctx.target_season > _date_qb.today().year - 1:
+        from nfl_proj.opportunity.depth_chart import (
+            LEAD_STARTER_GAMES_FLOOR, load_starter_depth_chart,
+        )
+        qb_games_floor = float(LEAD_STARTER_GAMES_FLOOR.get("QB", 0.0))
+        if qb_games_floor > 0:
+            dc = load_starter_depth_chart(ctx.target_season)
+            if dc.height > 0:
+                qb1_ids = dc.filter(
+                    (pl.col("depth_position") == "QB")
+                    & (pl.col("depth_rank") == 1)
+                ).select("player_id", "team")
+                merged = merged.join(
+                    qb1_ids.with_columns(pl.lit(True).alias("_is_qb1")),
+                    on=["player_id", "team"], how="left",
+                ).with_columns(
+                    pl.col("_is_qb1").fill_null(False),
+                ).with_columns(
+                    pl.when(pl.col("_is_qb1"))
+                      .then(
+                          pl.max_horizontal(
+                              pl.col("games_pred"),
+                              pl.lit(qb_games_floor),
+                          )
+                      )
+                      .otherwise(pl.col("games_pred"))
+                      .alias("games_pred"),
+                ).drop("_is_qb1")
+
+    merged = merged.with_columns(
         (pl.col("games_pred") / SEASON_GAMES).alias("games_scalar"),
     )
 
