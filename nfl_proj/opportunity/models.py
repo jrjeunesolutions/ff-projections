@@ -43,7 +43,7 @@ import polars as pl
 from sklearn.linear_model import Ridge
 
 from nfl_proj.backtest.pipeline import BacktestContext
-from nfl_proj.data import loaders
+from nfl_proj.data import coaches, loaders
 
 
 # Minimum usage threshold for inclusion in projection set. 2% target share
@@ -163,13 +163,54 @@ def _add_player_priors(
 # ---------------------------------------------------------------------------
 
 
-FEATURES: tuple[str, ...] = (
+# OC-level distribution priors joined per (team, season). When the player's
+# team for the target season has a first-time OC (no prior team-seasons)
+# the OC features fall back to the league-mean of that feature in the same
+# season, so the Ridge sees a neutral input rather than a missing one.
+# See ``nfl_proj/data/coaches.py``.
+#
+# Per-metric feature lists: target_share Ridge gets the WR / TE pool
+# priors; rush_share Ridge gets the lead-RB rush share. Mixing all three
+# into both Ridges added ~0.4pp regression on the rush_share lift in
+# backtest because the WR/TE priors are pure noise for rush attribution
+# and the small per-position rush_share training set (n=890) doesn't
+# regularise them out.
+OC_FEATURES_TS: tuple[str, ...] = (
+    "oc_lead_wr_share",
+    "oc_te_pool_share",
+)
+# Empty for rush_share. Adding ``oc_lead_rb_rush_share`` to the rush
+# Ridge regressed pooled lift by ~0.5pp in backtest because the rush
+# training set is small (n=890) and dominated by prior1 — additive
+# OC signal on RB rush_share was below the noise floor and added
+# variance to the residual prediction. Memory file
+# ``project_rush_share_architecture.md`` documents the brittleness of
+# this Ridge; OC features stay off it.
+OC_FEATURES_RS: tuple[str, ...] = ()
+# Union for the join + null-fill steps that need every column present.
+OC_FEATURES: tuple[str, ...] = tuple(
+    dict.fromkeys((*OC_FEATURES_TS, *OC_FEATURES_RS))
+)
+
+
+FEATURES_TS: tuple[str, ...] = (
     "prior1",
     "prior2",
     "prior3",
     "games_prior1",
     "years_played",
+    *OC_FEATURES_TS,
 )
+FEATURES_RS: tuple[str, ...] = (
+    "prior1",
+    "prior2",
+    "prior3",
+    "games_prior1",
+    "years_played",
+    *OC_FEATURES_RS,
+)
+# Backwards-compat alias used by callers that referenced FEATURES generically.
+FEATURES: tuple[str, ...] = FEATURES_TS
 
 
 @dataclass(frozen=True)
@@ -192,7 +233,8 @@ class OpportunityProjection:
 
 
 def _metric_frame(df: pl.DataFrame, metric: str) -> pl.DataFrame:
-    return df.select(
+    oc_cols = OC_FEATURES_RS if metric == "rush_share" else OC_FEATURES_TS
+    selectors: list = [
         "player_id",
         "player_display_name",
         "position",
@@ -203,13 +245,45 @@ def _metric_frame(df: pl.DataFrame, metric: str) -> pl.DataFrame:
         pl.col(f"{metric}_prior3").alias("prior3"),
         "games_prior1",
         "years_played",
-    )
+    ]
+    selectors.extend(oc_cols)
+    return df.select(*selectors)
+
+
+def _fill_oc_features(
+    frame: pl.DataFrame,
+) -> pl.DataFrame:
+    """
+    Mean-centre OC features (so a coefficient learned on them reflects
+    deviation from the league-wide OC pool) and fill nulls with zero
+    (= the centred-mean). The residual-form encoding matches the share
+    Ridges' own residual target (``share - prior1``); without it,
+    additive OC features lived almost entirely on the intercept and
+    contributed nothing per-player.
+    """
+    out = frame
+    for col in OC_FEATURES:
+        if col not in out.columns:
+            continue
+        mean = out[col].mean()
+        if mean is None:
+            mean = 0.0
+        out = out.with_columns(
+            (pl.col(col).fill_null(float(mean)).cast(pl.Float64) - float(mean))
+            .alias(col)
+        )
+    return out
+
+
+def _features_for(metric: str) -> tuple[str, ...]:
+    return FEATURES_RS if metric == "rush_share" else FEATURES_TS
 
 
 def _fit_share_model(
     history: pl.DataFrame, metric: str, *, alpha: float = 1.0
 ) -> ShareModel:
     """Residual-from-prior1 ridge, same pattern as Phase 1."""
+    feature_cols = _features_for(metric)
     frame = _metric_frame(history, metric)
     train = frame.filter(
         pl.col("target").is_not_null()
@@ -223,18 +297,19 @@ def _fit_share_model(
         pl.col("games_prior1").fill_null(0).cast(pl.Float64),
         pl.col("years_played").fill_null(1).cast(pl.Float64),
     )
+    train = _fill_oc_features(train)
     if train.height < 50:
         raise ValueError(
             f"_fit_share_model({metric}): only {train.height} rows."
         )
-    X = train.select(*FEATURES).to_numpy()
+    X = train.select(*feature_cols).to_numpy()
     y = (train["target"] - train["prior1"]).to_numpy()
     model = Ridge(alpha=alpha, random_state=0)
     model.fit(X, y)
     return ShareModel(
         metric=metric,
         model=model,
-        feature_cols=FEATURES,
+        feature_cols=feature_cols,
         n_train=train.height,
         train_r2=float(model.score(X, y)),
     )
@@ -259,6 +334,7 @@ def _predict_share(trained: ShareModel, history: pl.DataFrame) -> pl.DataFrame:
         pl.col("games_prior1").fill_null(0).cast(pl.Float64),
         pl.col("years_played").fill_null(1).cast(pl.Float64),
     )
+    usable = _fill_oc_features(usable)
     X = usable.select(*trained.feature_cols).to_numpy()
     residuals = trained.model.predict(X)
     base = usable["prior1"].to_numpy()
@@ -345,8 +421,27 @@ def project_opportunity(
             pl.col("target_share").alias("prior_ts"),
             pl.col("rush_share").alias("prior_rs"),
             pl.col("games").alias("prior_games"),
+            # Most-recent team — used as the player's projected team for
+            # target-season OC-feature lookup. Live mode overrides this
+            # below via team_assignment for offseason team changes.
+            pl.col("dominant_team").alias("target_team"),
         )
     )
+    # Live mode: override target_team with the team-assignment as-of
+    # ctx.as_of_date. This catches FA / trade moves (e.g. Saquon NYG→PHI)
+    # that aren't visible in last-season player stats.
+    try:
+        from nfl_proj.data.team_assignment import team_assignments_as_of
+        ta = team_assignments_as_of(
+            latest["player_id"].to_list(), ctx.as_of_date
+        ).select("player_id", pl.col("team").alias("ta_team"))
+        latest = latest.join(ta, on="player_id", how="left").with_columns(
+            pl.coalesce(pl.col("ta_team"), pl.col("target_team")).alias("target_team")
+        ).drop("ta_team")
+    except Exception:
+        # team_assignment is best-effort here; the fallback target_team
+        # (latest dominant) is what the model used pre-OC-feature work.
+        pass
     # years_played = count of distinct prior seasons the player has.
     years = (
         history.group_by("player_id")
@@ -363,10 +458,12 @@ def project_opportunity(
         pl.lit(None).cast(history_schema["targets"]).alias("targets"),
         pl.lit(None).cast(history_schema["carries"]).alias("carries"),
         pl.lit(None).cast(history_schema["receptions"]).alias("receptions"),
-        pl.lit(None).cast(history_schema["dominant_team"]).alias("dominant_team"),
+        # Target-season dominant_team comes from latest's target_team
+        # (= team_assignment override or last observed team).
+        pl.col("target_team").cast(history_schema["dominant_team"]).alias("dominant_team"),
         pl.lit(None).cast(history_schema["team_targets"]).alias("team_targets"),
         pl.lit(None).cast(history_schema["team_carries"]).alias("team_carries"),
-    ).drop(["prior_ts", "prior_rs", "prior_games"])
+    ).drop(["prior_ts", "prior_rs", "prior_games", "target_team"])
 
     history = pl.concat([history, target_rows], how="diagonal").sort(
         ["player_id", "season"]
@@ -379,6 +476,25 @@ def project_opportunity(
         pl.col("games").shift(1).over("player_id").alias("games_prior1"),
         pl.cum_count("season").over("player_id").alias("years_played"),
     )
+
+    # Join in per-(team, season) OC distribution priors (oc_lead_wr_share,
+    # oc_lead_rb_rush_share, oc_te_pool_share). The OC frame is keyed on
+    # (team, season); we join via the per-row dominant_team. For the
+    # target-season rows that team came from team_assignment / latest
+    # observed team. For historical rows it's the in-season dominant team.
+    try:
+        oc_priors = coaches.build_oc_priors(ctx).select(
+            pl.col("team").alias("dominant_team"),
+            pl.col("season").cast(history.schema["season"]),
+            *[pl.col(c) for c in OC_FEATURES],
+        )
+        history = history.join(
+            oc_priors, on=["dominant_team", "season"], how="left",
+        )
+    except FileNotFoundError:
+        # OC history CSV not present — degrade to league-mean fallback.
+        for col in OC_FEATURES:
+            history = history.with_columns(pl.lit(None).cast(pl.Float64).alias(col))
     ts_model = _fit_share_model(history, metric="target_share", alpha=alpha)
     rs_model = _fit_share_model(history, metric="rush_share", alpha=alpha)
 

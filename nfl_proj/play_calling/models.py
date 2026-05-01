@@ -23,6 +23,7 @@ import polars as pl
 from sklearn.linear_model import Ridge
 
 from nfl_proj.backtest.pipeline import BacktestContext
+from nfl_proj.data import coaches
 from nfl_proj.team.features import TEAM_NORMALIZATION
 from nfl_proj.team.models import TeamProjection, project_team_season
 
@@ -82,6 +83,10 @@ FEATURES: tuple[str, ...] = (
     "wins_pred",
     "coach_changed",
     "league_prior1",
+    # OC-level pass-rate prior — recency-weighted mean of the team's
+    # current OC's prior team-seasons. Falls back to league_prior1
+    # when the OC has no qualifying history (first-time OC).
+    "oc_pass_rate_prior",
 )
 
 
@@ -169,6 +174,20 @@ def _build_feature_frame(
     pr = pr.join(team_info, on=["team", "season"], how="left")
     pr = pr.join(ts, on=["team", "season"], how="left")
 
+    # OC-level pass-rate prior. Best-effort: missing CSV / lookup errors
+    # degrade to a null column that gets filled with league_prior1 in fit/
+    # predict.
+    try:
+        oc_priors = coaches.build_oc_priors(ctx).select(
+            "team", "season", "oc_pass_rate_prior",
+        )
+        pr = pr.join(
+            oc_priors.with_columns(pl.col("season").cast(pr.schema["season"])),
+            on=["team", "season"], how="left",
+        )
+    except FileNotFoundError:
+        pr = pr.with_columns(pl.lit(None).cast(pl.Float64).alias("oc_pass_rate_prior"))
+
     # Baseline: just prior1 (persistence).
     pr = pr.with_columns(pl.col("prior1").alias("pass_rate_baseline"))
     return pr
@@ -188,6 +207,8 @@ def fit_pass_rate_model(
         pl.col("prior2").fill_null(pl.col("prior1")),
         pl.col("prior3").fill_null(pl.col("prior1")),
         pl.col("coach_changed").fill_null(0).cast(pl.Float64),
+        # First-time OC -> use the league prior; same idea as prior2/3.
+        pl.col("oc_pass_rate_prior").fill_null(pl.col("league_prior1")),
     )
     if train.height < 32:
         raise ValueError(
@@ -214,6 +235,7 @@ def predict_pass_rate(
         pl.col("prior2").fill_null(pl.col("prior1")),
         pl.col("prior3").fill_null(pl.col("prior1")),
         pl.col("coach_changed").fill_null(0).cast(pl.Float64),
+        pl.col("oc_pass_rate_prior").fill_null(pl.col("league_prior1")),
     )
     X = usable.select(*trained.feature_cols).to_numpy()
     residuals = trained.model.predict(X)
