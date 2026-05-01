@@ -228,6 +228,8 @@ def _veteran_counting_stats(
     opp: OpportunityProjection,
     eff: EfficiencyProjection,
     avail: AvailabilityProjection,
+    qb: QBProjection | None = None,
+    rookies: RookieProjection | None = None,
 ) -> pl.DataFrame:
     """
     Build per-veteran counting stats (targets / carries / yds / TDs /
@@ -239,6 +241,23 @@ def _veteran_counting_stats(
       availability (player_id, games_pred)
       last_team    (player_id, team) — fallback target-season team
       team_volumes (team, team_targets, team_carries)
+
+    QB-rush + rookie partitioning (added 2026-04-30): when ``qb`` and/or
+    ``rookies`` are supplied, we subtract their projected per-team
+    target / carry totals from ``team_targets`` / ``team_carries``
+    BEFORE applying veteran shares. Without this, mobile-QB teams
+    (HOU/KC/TEN/SEA/WAS) double-count rushes — the veteran-share sum
+    normalizes to 1.0 of the *full* team_carries, then QB carries get
+    added on top in ``_qb_counting_stats``, pushing rush coverage to
+    110-126%. The same problem exists for rookies (whose absolute
+    targets/carries from ``project_rookies`` bypass veteran share
+    normalization) — see e.g. Jeremiyah Love (213 carries) added on
+    top of Allgeier's full-team-share-normalized 91 at ARI.
+
+    After partitioning, veteran shares scale to 1.0 of
+    ``team_carries - team_qb_carries - team_rookie_carries`` and the
+    team total stays in bounds. Falls back to the prior behavior when
+    qb/rookies are None.
     """
     # Source frames
     opp_f = opp.projections.select(
@@ -301,6 +320,62 @@ def _veteran_counting_stats(
             "%d/%d rows (retired/unsigned/cross-season ghosts)",
             before_n - merged.height, before_n,
         )
+
+    # QB + rookie partitioning: subtract per-team QB rush attempts and
+    # rookie targets/carries from team volumes so veteran shares only
+    # allocate what's left. Without this step:
+    #   * mobile-QB teams (HOU/KC/TEN/SEA/WAS) over-attribute rushes by
+    #     ~10-25% (the QB rush volume that's added on top in
+    #     ``_qb_counting_stats``);
+    #   * rookie-heavy teams (ARI w/ Jeremiyah Love, JAX w/ Tuten,
+    #     LV w/ Mendoza) over-attribute by the rookie absolute totals
+    #     from ``project_rookies``, which bypass veteran share
+    #     normalization.
+    # team_vol is mutated to carry the partitioned ``team_targets`` /
+    # ``team_carries`` columns from here on.
+    if qb is not None and qb.qbs.height > 0:
+        team_qb_rush = (
+            qb.qbs.group_by("team")
+            .agg(pl.col("rush_attempts_pred").sum().alias("team_qb_carries"))
+        )
+        team_vol = (
+            team_vol.join(team_qb_rush, on="team", how="left")
+            .with_columns(pl.col("team_qb_carries").fill_null(0.0))
+            .with_columns(
+                pl.max_horizontal(
+                    pl.col("team_carries") - pl.col("team_qb_carries"),
+                    pl.lit(0.0),
+                ).alias("team_carries")
+            )
+            .drop("team_qb_carries")
+        )
+
+    if rookies is not None and rookies.projections.height > 0:
+        rk = rookies.projections.filter(pl.col("team").is_not_null())
+        if rk.height > 0:
+            team_rookie_vol = rk.group_by("team").agg(
+                pl.col("targets_pred").sum().alias("team_rookie_targets"),
+                pl.col("carries_pred").sum().alias("team_rookie_carries"),
+            )
+            team_vol = (
+                team_vol.join(team_rookie_vol, on="team", how="left")
+                .with_columns(
+                    pl.col("team_rookie_targets").fill_null(0.0),
+                    pl.col("team_rookie_carries").fill_null(0.0),
+                )
+                .with_columns(
+                    pl.max_horizontal(
+                        pl.col("team_targets") - pl.col("team_rookie_targets"),
+                        pl.lit(0.0),
+                    ).alias("team_targets"),
+                    pl.max_horizontal(
+                        pl.col("team_carries") - pl.col("team_rookie_carries"),
+                        pl.lit(0.0),
+                    ).alias("team_carries"),
+                )
+                .drop(["team_rookie_targets", "team_rookie_carries"])
+            )
+
     merged = merged.join(team_vol, on="team", how="left")
 
     # Default games = SEASON_GAMES if no availability projection (very
@@ -662,7 +737,8 @@ def project_fantasy_points(
 
     team_vol = _team_volumes(team, play_calling)
     vets = _veteran_counting_stats(
-        ctx, team_vol, opportunity, efficiency, availability
+        ctx, team_vol, opportunity, efficiency, availability,
+        qb=qb, rookies=rookies,
     )
     rooks = _rookie_counting_stats(rookies)
     qbs = _qb_counting_stats(qb)

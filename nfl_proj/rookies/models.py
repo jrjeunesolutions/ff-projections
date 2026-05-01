@@ -45,8 +45,11 @@ Output column compatibility:
 
 from __future__ import annotations
 
+import json as _json
 import logging
+import re as _re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import polars as pl
@@ -57,6 +60,157 @@ from nfl_proj.data.rookie_grades import load_prospect_rankings
 from nfl_proj.data.rookie_matching import match_prospects_to_draft
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Rookie enrichment (added 2026-04-30)
+# ---------------------------------------------------------------------------
+#
+# project_rookies emits rows with NULL player_id and NULL team for
+# prospects who haven't been matched to a gsis_id at projection time.
+# Without enrichment, downstream consumers (parquet export + the QB/
+# rookie partitioning in scoring.points._veteran_counting_stats) treat
+# these rows as team-less, which causes:
+#   - the export to ship null teams in the v1 parquet
+#   - the partition logic to miss rookie carries entirely (rookies don't
+#     get subtracted from team_carries before veteran share normalization,
+#     so vets + rookies double-count for rookie-heavy teams like ARI/JAX/LV).
+#
+# The enrichment runs inside project_rookies so EVERY consumer (export
+# script, project_fantasy_points pipeline, ad-hoc callers) sees the same
+# enriched frame. Two-source pattern:
+#   1. nflreadpy.load_rosters(seasons=[year]) — fills both gsis_id and
+#      team. Lags the draft 1-2 weeks for the freshly-drafted class.
+#   2. CFBD picks cache (cross-workspace path) — fills team only. Bridges
+#      the gap when nflreadpy lags.
+
+# Cross-workspace fallback path. The research workspace owns the
+# CFBD picks cache; we read it as secondary. The hard-coded path is
+# acceptable here because it's a *fallback* — the projections module
+# still runs without it (rookies just stay team-less in that case).
+_CFBD_PICKS_CACHE_DEFAULT = Path(
+    "/Users/jonathanjeune/Library/CloudStorage/OneDrive-Personal/"
+    "Fantasy Football/ffootball-research/imported-data/"
+    "official_draft_picks_cache.json"
+)
+
+_CFBD_TEAM_LONG_TO_ABBR: dict[str, str] = {
+    "Arizona": "ARI", "Atlanta": "ATL", "Baltimore": "BAL", "Buffalo": "BUF",
+    "Carolina": "CAR", "Chicago": "CHI", "Cincinnati": "CIN", "Cleveland": "CLE",
+    "Dallas": "DAL", "Denver": "DEN", "Detroit": "DET", "Green Bay": "GB",
+    "Houston": "HOU", "Indianapolis": "IND", "Jacksonville": "JAX",
+    "Kansas City": "KC", "Las Vegas": "LV", "Los Angeles Chargers": "LAC",
+    "Los Angeles Rams": "LAR", "Miami": "MIA", "Minnesota": "MIN",
+    "New England": "NE", "New Orleans": "NO", "New York Giants": "NYG",
+    "New York Jets": "NYJ", "Philadelphia": "PHI", "Pittsburgh": "PIT",
+    "San Francisco": "SF", "Seattle": "SEA", "Tampa Bay": "TB",
+    "Tennessee": "TEN", "Washington": "WAS",
+    "Los Angeles": "LAR", "New York": "NYG",
+}
+
+
+def _norm_name(s: str | None) -> str:
+    return _re.sub(r"[^a-z]", "", (s or "").lower())
+
+
+def _load_cfbd_team_index(
+    cache_path: Path = _CFBD_PICKS_CACHE_DEFAULT,
+) -> dict[str, str]:
+    """Load CFBD picks cache → ``norm(name) → team_abbr``.
+
+    Returns ``{}`` if the cache file is missing or malformed — callers
+    treat that as "no secondary source available".
+    """
+    if not cache_path.exists():
+        return {}
+    try:
+        payload = _json.loads(cache_path.read_text())
+    except (OSError, _json.JSONDecodeError):
+        return {}
+    picks = payload.get("picks", {})
+    out: dict[str, str] = {}
+    for name, info in picks.items():
+        nfl_team_long = (info or {}).get("nfl_team", "") or ""
+        abbr = _CFBD_TEAM_LONG_TO_ABBR.get(nfl_team_long.strip())
+        if abbr:
+            out[_norm_name(name)] = abbr
+    return out
+
+
+def enrich_rookies(df: pl.DataFrame, season: int) -> pl.DataFrame:
+    """Fill ``player_id`` + ``team`` for null-pid / null-team rookie rows.
+
+    Two-source enrichment, in order of preference:
+
+      1. ``nflreadpy.load_rosters(seasons=[season])`` — fills both
+         gsis_id and team. Typically lags the draft by 1-2 weeks for
+         the freshly-drafted class.
+      2. CFBD picks cache (research repo) — fills team only (pick info
+         doesn't carry gsis_id). Bridges the gap when nflreadpy lags.
+
+    Unmatched rows keep their nulls — better than fabricating.
+    """
+    if df.height == 0:
+        return df
+    null_pid_mask = df.get_column("player_id").is_null()
+    null_team_mask = df.get_column("team").is_null()
+    if not (null_pid_mask.any() or null_team_mask.any()):
+        return df
+
+    primary_index: dict[str, dict] = {}
+    try:
+        import nflreadpy as nfl
+
+        ros = (
+            nfl.load_rosters(seasons=[season])
+            .select("gsis_id", "full_name", "team", "position")
+            .drop_nulls(["gsis_id", "full_name"])
+            .unique(subset=["gsis_id"], keep="first")
+        )
+        for r in ros.iter_rows(named=True):
+            key = _norm_name(r["full_name"])
+            if key:
+                primary_index.setdefault(key, r)
+    except Exception as e:  # pragma: no cover — network/data pull failure
+        log.warning("enrich_rookies: nflreadpy load_rosters failed (%s)", e)
+
+    cfbd_team_index = _load_cfbd_team_index()
+
+    pids: list[str | None] = df.get_column("player_id").to_list()
+    teams: list[str | None] = df.get_column("team").to_list()
+    names = df.get_column("player_display_name").to_list()
+    matched_primary = 0
+    matched_secondary = 0
+    for i, (pid, team, name) in enumerate(zip(pids, teams, names)):
+        if pid is not None and team is not None:
+            continue
+        if not name:
+            continue
+        norm = _norm_name(name)
+        match = primary_index.get(norm)
+        if match:
+            if pid is None:
+                pids[i] = match["gsis_id"]
+            if team is None:
+                teams[i] = match["team"]
+            matched_primary += 1
+            continue
+        if team is None:
+            secondary = cfbd_team_index.get(norm)
+            if secondary:
+                teams[i] = secondary
+                matched_secondary += 1
+
+    df = df.with_columns(
+        pl.Series("player_id", pids, dtype=pl.Utf8),
+        pl.Series("team", teams, dtype=pl.Utf8),
+    )
+    if matched_primary or matched_secondary:
+        log.info(
+            "enrich_rookies: nflreadpy match %d, CFBD cache match %d",
+            matched_primary, matched_secondary,
+        )
+    return df
 
 
 FANTASY_POSITIONS = {"QB", "RB", "WR", "TE"}
@@ -530,6 +684,14 @@ def project_rookies(
         proj, un_p, un_r = _project_post_draft(ctx, lookup, format_key)
     else:
         proj, un_p, un_r = _project_pre_draft(ctx, lookup, format_key)
+
+    # Enrich null player_id / team rows (typical for the freshly-drafted
+    # class before nflreadpy ingests it). See module docstring above
+    # ``enrich_rookies`` for why this lives in project_rookies rather than
+    # in the export script — downstream partitioning logic in
+    # scoring.points needs enriched teams to subtract rookie volumes
+    # before veteran share normalization.
+    proj = enrich_rookies(proj, ctx.target_season)
 
     return RookieProjection(
         lookup=lookup,
