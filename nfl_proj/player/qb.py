@@ -246,6 +246,29 @@ def _project_qb_rates(
     # is mathematically equivalent to a 90pp share penalty. Fix: weight
     # each season by min(1, pass_attempts / 200) so a full starter year
     # gets weight 1.0 and a 50-attempt backup year gets weight 0.25.
+    # HEALTHY-SEASON FILTER for rate aggregation: when computing
+    # per-game rush volume (rapg) and per-attempt rates (rush_ypc,
+    # rush_td_rate), use ONLY seasons where the player was healthy
+    # enough to be on his usual usage pace (games ≥ 12). Falls back
+    # to all seasons when the player has no healthy ones.
+    #
+    # Rationale: a 7-game injury year (Daniels 2025) or even a
+    # 13-game limited-action year (Lamar 2025: still played but
+    # injury-affected pace 26.8 vs healthy 53/g) drags the rate
+    # aggregate down. The MIN(1, games/14) soft-weight from the
+    # initial fix barely moved 13-game seasons; the threshold-based
+    # filter is more effective for moderate injury cases.
+    #
+    # Per-attempt PASS rates (ypa, comp%, pass_td_rate, int_rate)
+    # don't need this filter — rates are invariant to game count
+    # and a healthy QB hits the same ypa whether he plays 7 games
+    # or 17. Pass rates use ALL last-3 seasons (the original
+    # behavior).
+    # Threshold 14: catches moderate injury years (Lamar 2025 = 13 games,
+    # not just severe-stub years like Daniels 2025 = 7 games). 14 keeps
+    # players who missed 1-2 starts in normal seasons, but excludes
+    # players who were limited / playing-through-injury for ≥ 3 starts.
+    HEALTHY_GAMES_THRESHOLD: float = 14.0
     last3_with_share = last3.with_columns(
         (
             pl.col("pass_attempts") / pl.col("team_qb_attempts").clip(1)
@@ -254,6 +277,15 @@ def _project_qb_rates(
             pl.lit(1.0),
             pl.col("pass_attempts").cast(pl.Float64) / 200.0,
         ).alias("starter_weight"),
+        # Healthy-season indicator (1 if games ≥ 12, else 0).
+        (pl.col("games") >= HEALTHY_GAMES_THRESHOLD).cast(pl.Float64)
+            .alias("is_healthy"),
+    ).with_columns(
+        # Healthy-only per-game rush volumes.
+        (pl.col("rush_attempts") * pl.col("is_healthy")).alias("_ra_h"),
+        (pl.col("rush_yards") * pl.col("is_healthy")).alias("_ry_h"),
+        (pl.col("rush_tds") * pl.col("is_healthy")).alias("_rtd_h"),
+        (pl.col("games") * pl.col("is_healthy")).alias("_games_h"),
     )
     rolled = last3_with_share.group_by("player_id", maintain_order=True).agg(
         pl.col("player_display_name").last(),
@@ -267,6 +299,11 @@ def _project_qb_rates(
         pl.col("rush_tds").sum().alias("rtd_sum"),
         pl.col("games").sum().alias("games_sum"),
         pl.col("team_qb_attempts").sum().alias("team_att_sum"),
+        # Healthy-season-only sums for rate aggregation.
+        pl.col("_ra_h").sum().alias("ra_h_sum"),
+        pl.col("_ry_h").sum().alias("ry_h_sum"),
+        pl.col("_rtd_h").sum().alias("rtd_h_sum"),
+        pl.col("_games_h").sum().alias("games_h_sum"),
         # Starter-weighted average of per-season qb_share. Falls back
         # to plain att_sum/team_att_sum when no season had ≥1 starter
         # weight (everyone was a deep backup).
@@ -278,22 +315,32 @@ def _project_qb_rates(
     )
 
     rolled = rolled.with_columns(
-        # Raw sample rates
+        # Raw sample rates (per-attempt PASS rates: ALL seasons —
+        # rates are invariant to game count).
         (pl.col("comp_sum") / pl.col("att_sum").clip(1)).alias("comp_pct_raw"),
         (pl.col("yds_sum") / pl.col("att_sum").clip(1)).alias("ypa_raw"),
         (pl.col("ptd_sum") / pl.col("att_sum").clip(1)).alias("ptd_rate_raw"),
         (pl.col("int_sum") / pl.col("att_sum").clip(1)).alias("int_rate_raw"),
-        (pl.col("ra_sum") / pl.col("games_sum").clip(1)).alias("rapg_raw"),
-        (
-            pl.when(pl.col("ra_sum") > 0)
-            .then(pl.col("ry_sum") / pl.col("ra_sum"))
-            .otherwise(means["rush_ypc"])
-        ).alias("rypc_raw"),
-        (
-            pl.when(pl.col("ra_sum") > 0)
-            .then(pl.col("rtd_sum") / pl.col("ra_sum"))
-            .otherwise(means["rush_td_rate"])
-        ).alias("rtd_rate_raw"),
+        # RUSH rates — healthy-season-only when available, else fall
+        # back to all seasons (so a player with no healthy prior
+        # still gets a projection from his injury years rather than
+        # nothing).
+        pl.when(pl.col("games_h_sum") > 0)
+        .then(pl.col("ra_h_sum") / pl.col("games_h_sum"))
+        .otherwise(pl.col("ra_sum") / pl.col("games_sum").clip(1))
+        .alias("rapg_raw"),
+        pl.when((pl.col("ra_h_sum") > 0))
+        .then(pl.col("ry_h_sum") / pl.col("ra_h_sum"))
+        .when(pl.col("ra_sum") > 0)
+        .then(pl.col("ry_sum") / pl.col("ra_sum"))
+        .otherwise(means["rush_ypc"])
+        .alias("rypc_raw"),
+        pl.when((pl.col("ra_h_sum") > 0))
+        .then(pl.col("rtd_h_sum") / pl.col("ra_h_sum"))
+        .when(pl.col("ra_sum") > 0)
+        .then(pl.col("rtd_sum") / pl.col("ra_sum"))
+        .otherwise(means["rush_td_rate"])
+        .alias("rtd_rate_raw"),
         # qb_share_raw uses the starter-weighted version when at least
         # one season had meaningful starter time; otherwise falls back
         # to the plain att_sum/team_att_sum (which is fine for a player
@@ -325,16 +372,28 @@ def _project_qb_rates(
             pl.col("int_rate_raw"), pl.col("att_sum"),
             means["int_rate"], PASS_PRIOR_ATTEMPTS,
         ).alias("int_rate_pred"),
+        # Rush rates use HEALTHY-season evidence weight when present
+        # (matches the rate filter in rapg_raw etc.). Falls back to
+        # all-seasons weight when the player has no healthy priors.
         _shrink_rate(
-            pl.col("rapg_raw"), pl.col("games_sum"),
+            pl.col("rapg_raw"),
+            pl.when(pl.col("games_h_sum") > 0)
+              .then(pl.col("games_h_sum"))
+              .otherwise(pl.col("games_sum")),
             means["rush_att_per_g"], RUSH_PRIOR_GAMES,
         ).alias("rush_att_per_g_pred"),
         _shrink_rate(
-            pl.col("rypc_raw"), pl.col("ra_sum"),
+            pl.col("rypc_raw"),
+            pl.when(pl.col("ra_h_sum") > 0)
+              .then(pl.col("ra_h_sum"))
+              .otherwise(pl.col("ra_sum")),
             means["rush_ypc"], RUSH_PRIOR_GAMES * 10.0,
         ).alias("rush_ypc_pred"),
         _shrink_rate(
-            pl.col("rtd_rate_raw"), pl.col("ra_sum"),
+            pl.col("rtd_rate_raw"),
+            pl.when(pl.col("ra_h_sum") > 0)
+              .then(pl.col("ra_h_sum"))
+              .otherwise(pl.col("ra_sum")),
             means["rush_td_rate"], RUSH_PRIOR_GAMES * 5.0,
         ).alias("rush_td_rate_pred"),
         _shrink_rate(
