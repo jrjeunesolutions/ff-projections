@@ -1,30 +1,37 @@
 """
 Per-team per-zone volume projections.
 
-Strategy: **flat-fraction** as a first cut. For each zone, compute the
-league-wide fraction of total team targets / carries that fall in that
-zone over recent history; then apply that fraction to each team's
-projected ``team_targets`` / ``team_carries`` to get the zone volume.
+Two strategies, picked at the call site:
 
-This deliberately uses league-mean fractions rather than per-team
-historical zone fractions: per-team zone fractions are noisy
-season-to-season, and a coaching-scheme effect (a team that throws
-heavily inside the 5) shows up just as much in our share denominators
-(zone share is renormalized over the team's actual zone targets) as
-it would in a per-team fraction. Starting with the simpler approach
-keeps the harness regression risk low.
+1. **Per-team Ridge (default).** One Ridge per zone metric (8 total)
+   fits the per-team zone fraction's residual from prior1, picking up
+   coaching-scheme persistence (heavy-RZ-passing vs heavy-RZ-rushing
+   teams) and team-specific drift. See
+   ``nfl_proj/situational/team_volume_ridges.py``. Per-zone gating: a
+   Ridge that doesn't beat prior1-carry-forward by ≥ 5% MAE on the
+   training fold falls back to flat-fraction for that zone only.
 
-Fractions are computed once per ctx from the same pbp seasons used to
-calibrate the zone TD yield rates (default last ~5 historical
-seasons).
+2. **Flat-fraction (fallback / ablation).** League-wide fraction of
+   total team targets / carries that fall in each zone over the last
+   ``calibration_seasons`` historical seasons. Era-correct but team-
+   blind.
+
+The downstream gamescript RZ-tilt (``RZ_PASS_TILT_GAMMA``) is applied
+AFTER zone fractions are projected — both paths produce the same
+shape of output, so the tilt logic is unchanged.
 """
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import polars as pl
 
 from nfl_proj.backtest.pipeline import BacktestContext
 from nfl_proj.situational.aggregator import ZONE_NAMES, _zone_expr
+
+if TYPE_CHECKING:
+    from nfl_proj.situational.team_volume_ridges import ZoneVolumeRidges
 
 
 def league_zone_fractions(
@@ -89,6 +96,7 @@ def project_team_zone_volumes(
     fractions: dict[str, float] | None = None,
     calibration_seasons: int = 5,
     gamescript_games: pl.DataFrame | None = None,
+    zone_ridges: "ZoneVolumeRidges | None" = None,
 ) -> pl.DataFrame:
     """
     Augment ``team_targets`` (which carries ``team_targets`` and
@@ -100,6 +108,12 @@ def project_team_zone_volumes(
         team_targets_explosive
         team_carries_inside_5, ..., team_carries_open
         team_carries_explosive
+
+    Per-team zone fractions come from ``zone_ridges`` (when provided)
+    — falling back to flat ``fractions`` for any zone where the Ridge
+    didn't beat prior1-carry-forward, and for the explosive metric
+    which stays flat. When ``zone_ridges`` is None, the function uses
+    ``fractions`` for every zone (legacy flat path).
 
     NOTE: The downstream pass-attempt-rate factor
     ``TARGET_FROM_PASS_PLAY = 0.935`` is already applied to
@@ -116,15 +130,49 @@ def project_team_zone_volumes(
         fractions = league_zone_fractions(ctx.pbp, seasons=seasons)
 
     out = team_targets
-    for z in ZONE_NAMES:
-        out = out.with_columns(
-            (pl.col("team_targets") * fractions[f"target_frac_{z}"]).alias(
-                f"team_targets_{z}"
-            ),
-            (pl.col("team_carries") * fractions[f"carry_frac_{z}"]).alias(
-                f"team_carries_{z}"
-            ),
+
+    if zone_ridges is not None:
+        # Ridge path: join per-team zone fraction predictions, multiply
+        # by team_targets / team_carries.
+        ridge_preds = zone_ridges.per_team_predictions
+        out = out.join(ridge_preds, on="team", how="left")
+        for z in ZONE_NAMES:
+            tcol = f"target_frac_{z}_pred"
+            ccol = f"carry_frac_{z}_pred"
+            # Fill any null predictions (team missing from ridge frame)
+            # with the league flat-fraction so we never silently zero a
+            # team's RZ volume.
+            out = out.with_columns(
+                pl.col(tcol).fill_null(fractions[f"target_frac_{z}"]),
+                pl.col(ccol).fill_null(fractions[f"carry_frac_{z}"]),
+            ).with_columns(
+                (pl.col("team_targets") * pl.col(tcol)).alias(
+                    f"team_targets_{z}"
+                ),
+                (pl.col("team_carries") * pl.col(ccol)).alias(
+                    f"team_carries_{z}"
+                ),
+            )
+        # Drop the helper columns to keep the output schema identical
+        # to the flat-fraction path.
+        out = out.drop(
+            *[f"target_frac_{z}_pred" for z in ZONE_NAMES],
+            *[f"carry_frac_{z}_pred" for z in ZONE_NAMES],
         )
+    else:
+        for z in ZONE_NAMES:
+            out = out.with_columns(
+                (pl.col("team_targets") * fractions[f"target_frac_{z}"]).alias(
+                    f"team_targets_{z}"
+                ),
+                (pl.col("team_carries") * fractions[f"carry_frac_{z}"]).alias(
+                    f"team_carries_{z}"
+                ),
+            )
+
+    # Explosive metrics stay flat — explosive has its own dynamics
+    # (air_yards / yards_gained gates) and the Ridge is target/rush
+    # share by zone, not explosive frequency.
     out = out.with_columns(
         (pl.col("team_targets") * fractions["target_frac_explosive"]).alias(
             "team_targets_explosive"
