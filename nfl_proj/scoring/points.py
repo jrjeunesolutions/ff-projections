@@ -1311,6 +1311,126 @@ def project_fantasy_points(
         zone_shares=zone_shares, zone_td_rates=zone_td_rates,
     )
     rooks = _rookie_counting_stats(rookies)
+
+    # Compute the dedup id sets EARLY so the QB-coupling rec_aggs can use
+    # them. The eventual ``vets_filtered`` / ``rooks_filtered`` (further
+    # below) drops QB-pipeline ids and rookie-pipeline ids from vets so
+    # the combined frame doesn't double-count. The QB coupling needs the
+    # SAME deduped pool to avoid over-counting receivers (which would
+    # make pass_yds > rec_yds on teams where some player_ids appear in
+    # both vets and rookies).
+    _early_qb_ids = (
+        qb.qbs.select("player_id").drop_nulls().to_series().to_list()
+        if qb.qbs.height > 0 else []
+    )
+    _early_rookie_ids = (
+        rooks.select("player_id").drop_nulls().to_series().to_list()
+    )
+
+    # QB coupling at SOURCE (added 2026-05-01, extended 2026-05-01):
+    # Snap each QB's pass_tds_pred AND pass_yards_pred to the team's
+    # receiver / rookie aggregates, then recompute fantasy_points_pred
+    # to reflect both deltas. Replaces qb.qbs with a coupled version
+    # so EVERY downstream consumer (sp.qb.qbs, _qb_counting_stats,
+    # combined scoring) sees the same numbers.
+    #
+    # Why both: pass_tds = sum of receiver rec_tds by definition (every
+    # receiving TD is a passing TD). Same for yards. Without coupling,
+    # the QB pipeline's per-attempt rates and the receiver pipeline's
+    # per-target rates project the same underlying events independently
+    # and diverge — see audit on 2026-05-01: 50% mean abs delta on
+    # pass_yards vs rec_yards across teams; PIT pass_yds=581 vs
+    # rec_yds=4098 (Rodgers UFA-filtered, no real QB1 to absorb the
+    # team's pass volume).
+    #
+    # Per-QB allocation: split team_rec_tds and team_rec_yds across the
+    # team's QBs in proportion to their projected pass_attempts. So
+    # QB1 (high attempts) gets most of the team aggregate; QB2 gets a
+    # smaller slice; nothing is lost.
+    if qb.qbs.height > 0:
+        from nfl_proj.player.qb import PPR_QB, QBProjection
+        # Vets+rookies receiver aggregates per team — using the SAME
+        # dedup that combined will use downstream so no player is
+        # counted twice.
+        rec_aggs = (
+            pl.concat([
+                vets.filter(
+                    ~pl.col("player_id").is_in(_early_qb_ids)
+                    & ~pl.col("player_id").is_in(_early_rookie_ids)
+                ),
+                rooks.filter(
+                    pl.col("player_id").is_null()
+                    | ~pl.col("player_id").is_in(_early_qb_ids)
+                ),
+            ], how="diagonal_relaxed")
+            .filter(pl.col("team").is_not_null())
+            .group_by("team")
+            .agg(
+                pl.col("rec_tds_pred").fill_null(0.0).sum()
+                  .alias("team_rec_tds_for_coupling"),
+                pl.col("rec_yards_pred").fill_null(0.0).sum()
+                  .alias("team_rec_yds_for_coupling"),
+            )
+        )
+        # Per-team QB pass-attempt totals → per-QB share.
+        qb_team_att = qb.qbs.group_by("team").agg(
+            pl.col("pass_attempts_pred").sum()
+              .alias("team_qb_pass_att_total")
+        )
+        coupled_qbs = (
+            qb.qbs
+            .join(rec_aggs, on="team", how="left")
+            .join(qb_team_att, on="team", how="left")
+            .with_columns(
+                # QB's share of team pass attempts (clip denom to avoid div-zero).
+                (
+                    pl.col("pass_attempts_pred")
+                    / pl.col("team_qb_pass_att_total").clip(1.0)
+                ).alias("_qb_att_share_in_team"),
+            )
+            .with_columns(
+                # New pass_tds and pass_yards = team aggregate × QB's share.
+                # Falls back to original when team has no receiver
+                # projections (rec_tds_for_coupling null).
+                pl.when(pl.col("team_rec_tds_for_coupling").is_not_null())
+                  .then(
+                      pl.col("team_rec_tds_for_coupling")
+                      * pl.col("_qb_att_share_in_team")
+                  )
+                  .otherwise(pl.col("pass_tds_pred"))
+                  .alias("_new_pass_tds_pred"),
+                pl.when(pl.col("team_rec_yds_for_coupling").is_not_null())
+                  .then(
+                      pl.col("team_rec_yds_for_coupling")
+                      * pl.col("_qb_att_share_in_team")
+                  )
+                  .otherwise(pl.col("pass_yards_pred"))
+                  .alias("_new_pass_yds_pred"),
+            )
+            .with_columns(
+                # Adjust fantasy_points_pred for both deltas.
+                (
+                    pl.col("fantasy_points_pred")
+                    + PPR_QB["pass_tds"] * (
+                        pl.col("_new_pass_tds_pred") - pl.col("pass_tds_pred")
+                    )
+                    + PPR_QB["pass_yards"] * (
+                        pl.col("_new_pass_yds_pred") - pl.col("pass_yards_pred")
+                    )
+                ).alias("fantasy_points_pred"),
+            )
+            .with_columns(
+                pl.col("_new_pass_tds_pred").alias("pass_tds_pred"),
+                pl.col("_new_pass_yds_pred").alias("pass_yards_pred"),
+            )
+            .drop([
+                "team_rec_tds_for_coupling", "team_rec_yds_for_coupling",
+                "team_qb_pass_att_total", "_qb_att_share_in_team",
+                "_new_pass_tds_pred", "_new_pass_yds_pred",
+            ])
+        )
+        qb = QBProjection(qbs=coupled_qbs, league_means=qb.league_means)
+
     qbs = _qb_counting_stats(qb)
 
     # Dedupe order of priority:
@@ -1343,50 +1463,6 @@ def project_fantasy_points(
     combined = pl.concat(
         [vets_filtered, rooks_filtered, qbs], how="diagonal_relaxed"
     )
-
-    # QB pass_td COUPLING (added 2026-05-01): each QB's effective pass
-    # TDs should equal the sum of his team's receiver / rookie rec_tds —
-    # every receiving TD is also a passing TD, by definition. Without
-    # coupling, the QB's pass_td_rate is fit independently from the
-    # blended-zone receiver TDs, so the two diverge (e.g. NYJ team rec
-    # TDs sum to ~22 but Geno's flat-rate pass_tds projects ~17).
-    # Recompute fantasy_points_pred_qb by adjusting for the delta:
-    #   delta_pass_tds = team_rec_tds_sum − qb_original_pass_tds
-    #   fantasy_points_pred_qb += PPR_QB.pass_tds (= 4.0) × delta
-    # This snaps QB pass TDs to the team aggregate while preserving
-    # everything else in the QB scoring stack (yards, INTs, rush).
-    if qb.qbs.height > 0:
-        from nfl_proj.player.qb import PPR_QB
-        team_rec_tds = (
-            pl.concat([vets_filtered, rooks_filtered], how="diagonal_relaxed")
-            .filter(pl.col("team").is_not_null())
-            .group_by("team")
-            .agg(
-                pl.col("rec_tds_pred").fill_null(0.0).sum()
-                .alias("team_rec_tds_pred_for_coupling")
-            )
-        )
-        qb_orig_pass_tds = qb.qbs.select(
-            "player_id",
-            pl.col("pass_tds_pred").alias("_orig_pass_tds_pred"),
-        )
-        combined = combined.join(
-            team_rec_tds, on="team", how="left"
-        ).join(
-            qb_orig_pass_tds, on="player_id", how="left"
-        ).with_columns(
-            # Only adjust QB rows (those with non-null _orig_pass_tds_pred).
-            pl.when(pl.col("_orig_pass_tds_pred").is_not_null())
-            .then(
-                pl.col("fantasy_points_pred_qb")
-                + PPR_QB["pass_tds"] * (
-                    pl.col("team_rec_tds_pred_for_coupling").fill_null(0.0)
-                    - pl.col("_orig_pass_tds_pred")
-                )
-            )
-            .otherwise(pl.col("fantasy_points_pred_qb"))
-            .alias("fantasy_points_pred_qb"),
-        ).drop(["team_rec_tds_pred_for_coupling", "_orig_pass_tds_pred"])
 
     # Apply baseline values (attach, don't filter — baseline may be null
     # for rookies without a prior season).
