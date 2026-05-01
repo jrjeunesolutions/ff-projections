@@ -1006,6 +1006,23 @@ def project_rookies(
     # before veteran share normalization.
     proj = enrich_rookies(proj, ctx.target_season)
 
+    # Normalize relocated franchise codes (LA → LAR, STL → LAR, SD → LAC,
+    # OAK → LV) so the rookie pipeline matches the rest of the codebase.
+    # Without this, 2026 LAR rookies (Ty Simpson, Max Klare, etc.) were
+    # filed under team='LA' (nflreadpy draft data convention) and didn't
+    # appear in LAR-team queries downstream. Same fix the team_volumes
+    # path applies — see TEAM_NORMALIZATION usage in nfl_proj/team/features.py.
+    from nfl_proj.team.features import TEAM_NORMALIZATION
+    if "team" in proj.columns and TEAM_NORMALIZATION:
+        team_expr = pl.col("team")
+        for old, new in TEAM_NORMALIZATION.items():
+            team_expr = (
+                pl.when(pl.col("team") == old)
+                .then(pl.lit(new))
+                .otherwise(team_expr)
+            )
+        proj = proj.with_columns(team_expr.alias("team"))
+
     return RookieProjection(
         lookup=lookup,
         projections=proj,

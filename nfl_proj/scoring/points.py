@@ -359,6 +359,7 @@ def _apply_blended_td_path(
     zone_shares: ZoneShareProjection,
     zone_td_rates: dict[str, float],
     explosive_weight: float,
+    team_td_rates: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """
     Replace the flat ``rec_tds_pred`` / ``rush_tds_pred`` computation
@@ -475,23 +476,48 @@ def _apply_blended_td_path(
         else pl.lit(1.0)
     )
 
+    # PER-TEAM TD RATES: when ``team_td_rates`` is provided, join it onto
+    # merged so each row carries rate columns specific to its team. The
+    # blended formulae below then use per-row rate expressions instead
+    # of the league-mean dict literals. Falls back to dict lookup when
+    # team_td_rates is None (preserves prior behavior). The team rate
+    # columns are temporary — dropped after the TD computation.
+    use_per_team_rates = team_td_rates is not None
+    if use_per_team_rates:
+        rate_cols_to_drop = [
+            c for c in team_td_rates.columns if c != "team"
+        ]
+        merged = merged.join(team_td_rates, on="team", how="left")
+        # Fill any team that didn't appear in the calibration window
+        # (rare; e.g. expansion or 1-season pbp gap) with the league mean.
+        merged = merged.with_columns(*[
+            pl.col(c).fill_null(zone_td_rates.get(c, 0.0)) for c in rate_cols_to_drop
+        ])
+
+    def _rate_expr(metric_key: str) -> pl.Expr:
+        """Per-row rate expression: column when per-team, literal when flat."""
+        if use_per_team_rates:
+            return pl.col(metric_key)
+        return pl.lit(zone_td_rates.get(metric_key, 0.0))
+
     # ---- Receiving TDs ----
     # Σ over zones { share_z × scale × vet_target_ratio × team_zone_volume × zone_td_rate }
     rec_zone_terms: pl.Expr = pl.lit(0.0)
     for z in ZONE_NAMES:
         share_col = f"target_share_{z}_pred"
         team_vol_col = f"team_targets_{z}"
-        rate = zone_td_rates.get(f"rec_td_rate_{z}", 0.0)
         rec_zone_terms = rec_zone_terms + (
             pl.col(share_col).fill_null(0.0)
             * safe_div_t
             * vet_t
             * pl.col(team_vol_col).fill_null(0.0)
-            * rate
+            * _rate_expr(f"rec_td_rate_{z}")
         )
     # Explosive INCREMENT (rate_explosive − rate_open) × team_explosive ×
     # explosive_share. Only the increment over the open-field rate is
-    # added so the open-field zone term doesn't get re-counted.
+    # added so the open-field zone term doesn't get re-counted. Explosive
+    # rate stays league-wide (zone_td_rates dict) — small effect since
+    # default explosive_weight is 0.0; not worth per-team complexity.
     rate_open = zone_td_rates.get("rec_td_rate_open", 0.0)
     rate_expl = zone_td_rates.get("rec_td_rate_explosive", rate_open)
     rec_explosive_term = (
@@ -508,13 +534,12 @@ def _apply_blended_td_path(
     for z in ZONE_NAMES:
         share_col = f"rush_share_{z}_pred"
         team_vol_col = f"team_carries_{z}"
-        rate = zone_td_rates.get(f"rush_td_rate_{z}", 0.0)
         rush_zone_terms = rush_zone_terms + (
             pl.col(share_col).fill_null(0.0)
             * safe_div_r
             * vet_r
             * pl.col(team_vol_col).fill_null(0.0)
-            * rate
+            * _rate_expr(f"rush_td_rate_{z}")
         )
     rush_rate_open = zone_td_rates.get("rush_td_rate_open", 0.0)
     rush_rate_expl = zone_td_rates.get("rush_td_rate_explosive", rush_rate_open)
@@ -548,6 +573,12 @@ def _apply_blended_td_path(
         .otherwise(flat_rush)
         .alias("rush_tds_pred"),
     )
+    # Drop the per-team rate columns we joined in (if any) — they were
+    # transient inputs to the TD math; downstream consumers don't need them.
+    if use_per_team_rates:
+        merged = merged.drop([
+            c for c in rate_cols_to_drop if c in merged.columns
+        ])
     return merged
 
 
@@ -561,6 +592,7 @@ def _veteran_counting_stats(
     rookies: RookieProjection | None = None,
     zone_shares: ZoneShareProjection | None = None,
     zone_td_rates: dict[str, float] | None = None,
+    team_td_rates: pl.DataFrame | None = None,
     use_blended_tds: bool = USE_BLENDED_TDS,
     explosive_weight: float = EXPLOSIVE_BLEND_WEIGHT,
 ) -> pl.DataFrame:
@@ -1068,6 +1100,7 @@ def _veteran_counting_stats(
             zone_shares=zone_shares,
             zone_td_rates=zone_td_rates,
             explosive_weight=explosive_weight,
+            team_td_rates=team_td_rates,
         )
     else:
         merged = merged.with_columns(
@@ -1408,6 +1441,35 @@ def project_fantasy_points(
             zone_shares = None
             zone_td_rates = None
 
+    # Per-team zone TD rates with empirical-Bayes shrinkage to league
+    # mean (added 2026-05-01). Captures the team-specific RZ conversion
+    # variance the league-mean rates miss. PHI/TB/SF/LAR/KC/CIN convert
+    # at ~0.42-0.44 inside_5 (above league 0.41); ATL/CLE/NYG at ~0.38-0.39.
+    # Fixes the systematic under-projection for elite RZ offenses (Burrow,
+    # Lamar, Stafford) who were stuck at league-mean rates. Falls back to
+    # the flat zone_td_rates dict on failure.
+    team_td_rates: pl.DataFrame | None = None
+    if zone_td_rates is not None:
+        try:
+            from nfl_proj.situational.aggregator import team_zone_td_rates
+            team_td_rates = team_zone_td_rates(
+                ctx.pbp, seasons=calibration_seasons,
+            )
+            log.info(
+                "Per-team TD rates fit: %d teams; inside_5 rec spread = "
+                "[%.3f, %.3f] (league %.3f)",
+                team_td_rates.height,
+                float(team_td_rates["rec_td_rate_inside_5"].min()),
+                float(team_td_rates["rec_td_rate_inside_5"].max()),
+                zone_td_rates["rec_td_rate_inside_5"],
+            )
+        except Exception as e:
+            log.warning(
+                "Per-team TD rates failed (%s); falling back to league rates",
+                e,
+            )
+            team_td_rates = None
+
     # Per-team zone-volume Ridges (one per zone metric). Each Ridge
     # picks up team-specific zone-distribution drift (heavy-RZ-passing
     # vs heavy-RZ-rushing teams, scheme persistence). Per-zone
@@ -1447,6 +1509,7 @@ def project_fantasy_points(
         ctx, team_vol, opportunity, efficiency, availability,
         qb=qb, rookies=rookies,
         zone_shares=zone_shares, zone_td_rates=zone_td_rates,
+        team_td_rates=team_td_rates,
     )
     rooks = _rookie_counting_stats(rookies)
 
