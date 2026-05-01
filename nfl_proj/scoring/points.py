@@ -126,6 +126,23 @@ PPR: dict[str, float] = {
 # for A/B comparison and fast rollback.
 USE_BLENDED_TDS: bool = True
 
+# Top-down snap-state pass rate (added 2026-05-01). When True,
+# ``_team_volumes`` overrides the single-Ridge ``pass_rate_pred``
+# from ``play_calling/models.py`` with the snap-state-aggregated
+# rate from ``nfl_proj/snap_state/pass_rate.py``:
+#
+#     pass_rate = Σ snap_share_state × pass_rate_state
+#
+# This captures the empirical ~17pp pass-rate swing across game
+# states (49% lead_7+, 57% neutral, 67% trail_7+) — much stronger
+# than the single-Ridge mean_margin coefficient (~2pp swing). Live-
+# mode-only (target_season >= today.year) so the backtest harness
+# uses the legacy single-Ridge path which it was tuned against.
+#
+# Set to False to instantly fall back to the legacy Ridge for both
+# live and backtest seasons.
+USE_SNAP_STATE_PASSRATE: bool = True
+
 # Optional explosive-play term for the blended TD model. Empirical
 # (2018-2024 REG): explosive completions in the open field score TDs
 # ~8.2% of the time vs. ~0.6% for non-explosive open-field targets;
@@ -204,6 +221,33 @@ def _team_volumes(
     )
     pc = play_calling.projections.select("team", "season", "pass_rate_pred")
     merged = team.join(pc, on=["team", "season"], how="left")
+
+    # SNAP-STATE PASS RATE OVERRIDE (live-mode-only).
+    # Replaces the single-Ridge pass_rate_pred with a top-down
+    # aggregation of (snap_share × state_pass_rate) across the three
+    # snap states (trail_7+, neutral, lead_7+). Strong gamescript
+    # signal (~17pp swing across game states empirically) that the
+    # single Ridge's mean_margin coefficient (~2pp swing) couldn't
+    # capture due to multicollinearity with prior1.
+    #
+    # Gated to live target seasons (target_season >= today.year) so
+    # the backtest harness uses the legacy Ridge path it was tuned
+    # against. Set USE_SNAP_STATE_PASSRATE = False to disable
+    # globally for both live and backtest.
+    if USE_SNAP_STATE_PASSRATE and ctx is not None:
+        from datetime import date as _date
+        if ctx.target_season >= _date.today().year:
+            from nfl_proj.snap_state.pass_rate import (
+                project_snap_state_pass_rate,
+            )
+            ss = project_snap_state_pass_rate(
+                ctx, gamescript_games=gamescript_games,
+            ).select("team", pl.col("pass_rate_pred").alias("_ss_pass_rate"))
+            merged = merged.join(ss, on="team", how="left").with_columns(
+                pl.col("_ss_pass_rate").fill_null(pl.col("pass_rate_pred"))
+                  .alias("pass_rate_pred"),
+            ).drop("_ss_pass_rate")
+
     merged = merged.with_columns(
         (pl.col("plays_per_game_pred") * SEASON_GAMES).alias("team_plays"),
     ).with_columns(
