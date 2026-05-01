@@ -425,17 +425,37 @@ def _apply_blended_td_path(
     # level. ``zone_specialization`` (zone share / overall share) is the
     # invariant we preserve. When the prior is zero or null, fall back
     # to 1.0 (player keeps their static zone share).
+    # safe_div_t/r: per-player scale that adjusts zone shares when the
+    # overall share changes (player breakout, depth-chart reorder, team
+    # change, share floor / ceiling). Clipped to [0.5, 2.0] to prevent
+    # blow-ups when prior1 is artificially small — common cases:
+    #   * injured-prior players: Malik Nabers' overall_target_share_prior1
+    #     = 6.1% (6-game 2025 season; numerator caps but denominator is
+    #     full-season team targets), so a healthy 11% pred → 1.81x
+    #     multiplier on every zone TD. Without the cap his rec_tds
+    #     project at 17 (Mahomes-era Hill territory).
+    #   * team-changers: Isaiah Likely (BAL → NYG) sees safe_div blow up
+    #     when BAL's prior1 mass on him doesn't match NYG's projected
+    #     TE1 role.
+    #   * 2nd-year role expansion: Skattebo NYG, Hampton LAC.
+    # The ±50% cap covers legitimate ±50% role changes (typical breakout
+    # year) without the runaway-multiplier failure mode. Net impact at
+    # NYG team rec_TD level: 45.2 → ~30 (sane).
     safe_div_t = pl.when(
         pl.col("overall_target_share_prior1").fill_null(0.0) > 1e-6
     ).then(
-        pl.col("target_share_pred").fill_null(0.0)
-        / pl.col("overall_target_share_prior1")
+        (
+            pl.col("target_share_pred").fill_null(0.0)
+            / pl.col("overall_target_share_prior1")
+        ).clip(0.5, 2.0)
     ).otherwise(pl.lit(1.0))
     safe_div_r = pl.when(
         pl.col("overall_rush_share_prior1").fill_null(0.0) > 1e-6
     ).then(
-        pl.col("rush_share_pred").fill_null(0.0)
-        / pl.col("overall_rush_share_prior1")
+        (
+            pl.col("rush_share_pred").fill_null(0.0)
+            / pl.col("overall_rush_share_prior1")
+        ).clip(0.5, 2.0)
     ).otherwise(pl.lit(1.0))
 
     # The vet pool claims `vet_target_ratio` of total team volume; the

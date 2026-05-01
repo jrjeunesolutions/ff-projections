@@ -1,0 +1,40 @@
+team,season,hc_name,note
+# Hand-curated NFL head coach history. Mirrors oc_history.csv schema.
+# Source for 2026: ESPN NFL coaches page (https://www.espn.com/nfl/coaches),
+# fetched 2026-05-01.
+# Convention: when a head coach is also the primary play-caller, his name
+# also appears in oc_history.csv with note="HC play-caller". This file is
+# the authoritative HC reference for commentary; oc_history.csv remains
+# authoritative for the OC distribution model.
+ARI,2026,Mike LaFleur,
+ATL,2026,Kevin Stefanski,
+BAL,2026,Jesse Minter,
+BUF,2026,Joe Brady,
+CAR,2026,Dave Canales,
+CHI,2026,Ben Johnson,
+CIN,2026,Zac Taylor,
+CLE,2026,Todd Monken,
+DAL,2026,Brian Schottenheimer,
+DEN,2026,Sean Payton,
+DET,2026,Dan Campbell,
+GB,2026,Matt LaFleur,
+HOU,2026,DeMeco Ryans,
+IND,2026,Shane Steichen,
+JAX,2026,Liam Coen,
+KC,2026,Andy Reid,
+LV,2026,Klint Kubiak,
+LAC,2026,Jim Harbaugh,
+LAR,2026,Sean McVay,
+MIA,2026,Jeff Hafley,
+MIN,2026,Kevin O'Connell,
+NE,2026,Mike Vrabel,
+NO,2026,Kellen Moore,
+NYG,2026,John Harbaugh,
+NYJ,2026,Aaron Glenn,
+PHI,2026,Nick Sirianni,
+PIT,2026,Mike McCarthy,
+SF,2026,Kyle Shanahan,
+SEA,2026,Mike Macdonald,
+TB,2026,Todd Bowles,
+TEN,2026,Robert Saleh,
+WAS,2026,Dan Quinn,

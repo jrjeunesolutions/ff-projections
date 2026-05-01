@@ -1,0 +1,40 @@
+team,season,dc_name,note
+# Hand-curated NFL defensive coordinator history. Mirrors oc_history.csv schema.
+# Source for 2026: Gridiron Experts NFL coaching staff directory
+# (https://gridironexperts.com/nfl-coaches-list/), fetched 2026-05-01.
+# Convention: when a head coach is also the primary play-caller on
+# defense (rare; e.g. Bill Belichick historically), his name is entered
+# as the DC for that season with note="HC play-caller". Default is the
+# titled DC.
+ARI,2026,Nick Rallis,
+ATL,2026,Jeff Ulbrich,
+BAL,2026,Anthony Weaver,
+BUF,2026,Jim Leonhard,
+CAR,2026,Ejiro Evero,
+CHI,2026,Dennis Allen,
+CIN,2026,Al Golden,
+CLE,2026,Mike Rutenberg,
+DAL,2026,Christian Parker,
+DEN,2026,Vance Joseph,
+DET,2026,Kelvin Sheppard,
+GB,2026,Jonathan Gannon,
+HOU,2026,Matt Burke,
+IND,2026,Lou Anarumo,
+JAX,2026,Anthony Campanile,
+KC,2026,Steve Spagnuolo,
+LV,2026,Rob Leonard,
+LAC,2026,Chris O'Leary,
+LAR,2026,Chris Shula,
+MIA,2026,Sean Duggan,
+MIN,2026,Brian Flores,
+NE,2026,Zak Kuhr,
+NO,2026,Brandon Staley,
+NYG,2026,Dennard Wilson,
+NYJ,2026,Brian Duker,
+PHI,2026,Vic Fangio,
+PIT,2026,Patrick Graham,
+SF,2026,Raheem Morris,
+SEA,2026,Aden Durde,
+TB,2026,Danny Smith,
+TEN,2026,Gus Bradley,
+WAS,2026,Daronte Jones,
