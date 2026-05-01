@@ -922,4 +922,80 @@ def project_qb(
     else:
         all_qbs = vet_out
 
+    # POST-CONCAT TEAM-TOTAL CAP (added 2026-05-01). The team-constrained
+    # joint-allocation block above only sees vet QBs because rookies are
+    # projected after that block runs. Rookie QBs come in with cohort-mean
+    # games_pred (R1 ~10g, R2 ~6g, ...) which assumes they're starters —
+    # but most rookies sit behind an established vet (Mendoza behind
+    # Cousins at LV, Simpson behind Stafford at LAR, Beck behind Brissett
+    # at ARI). Without this cap, NYG / LV / LAR / ARI / NYJ would sum
+    # to 22-29 QB games per team (vs the 17-game season cap).
+    #
+    # Algorithm: per team, identify QB1 = the QB with the highest
+    # games_pred (which post-floor is the depth-chart-1 starter for live
+    # mode, or the highest-availability vet otherwise). For all other
+    # QBs on the team, scale their games_pred by:
+    #
+    #     scale = max(0, 17 - QB1_games) / sum(non_QB1_games_pred)
+    #
+    # All games-scaled counting stats (pass_attempts, pass_yards,
+    # pass_tds, ints, rush_attempts, rush_yards, rush_tds, fantasy_points)
+    # are linear in games_pred by construction, so they're scaled by
+    # the same ratio (new_games / old_games).
+    if all_qbs.height > 0:
+        team_qb1 = (
+            all_qbs.sort(["team", "games_pred"], descending=[False, True])
+            .group_by("team", maintain_order=True)
+            .agg(
+                pl.col("games_pred").first().alias("_qb1_games"),
+                pl.col("player_id").first().alias("_qb1_id"),
+            )
+        )
+        team_backup_total = (
+            all_qbs.join(team_qb1, on="team", how="left")
+            .filter(pl.col("player_id") != pl.col("_qb1_id"))
+            .group_by("team")
+            .agg(pl.col("games_pred").sum().alias("_backup_total"))
+        )
+        all_qbs = (
+            all_qbs.join(team_qb1, on="team", how="left")
+            .join(team_backup_total, on="team", how="left")
+            .with_columns(pl.col("_backup_total").fill_null(0.0))
+            .with_columns(
+                # Residual capacity for backups (>= 0).
+                pl.max_horizontal(
+                    pl.lit(0.0), pl.lit(SEASON_GAMES) - pl.col("_qb1_games")
+                ).alias("_residual"),
+            )
+            .with_columns(
+                # Per-row scale factor: 1.0 for QB1, residual/backup_total
+                # (capped at 1.0) for backups, 1.0 if backup_total is 0.
+                pl.when(pl.col("player_id") == pl.col("_qb1_id"))
+                .then(pl.lit(1.0))
+                .when(pl.col("_backup_total") > 0)
+                .then(
+                    pl.min_horizontal(
+                        pl.lit(1.0),
+                        pl.col("_residual") / pl.col("_backup_total"),
+                    )
+                )
+                .otherwise(pl.lit(1.0))
+                .alias("_scale"),
+            )
+            .with_columns(
+                # Apply scale to games_pred and every games-scaled volume.
+                (pl.col("games_pred") * pl.col("_scale")).alias("games_pred"),
+                (pl.col("pass_attempts_pred") * pl.col("_scale")).alias("pass_attempts_pred"),
+                (pl.col("completions_pred") * pl.col("_scale")).alias("completions_pred"),
+                (pl.col("pass_yards_pred") * pl.col("_scale")).alias("pass_yards_pred"),
+                (pl.col("pass_tds_pred") * pl.col("_scale")).alias("pass_tds_pred"),
+                (pl.col("ints_pred") * pl.col("_scale")).alias("ints_pred"),
+                (pl.col("rush_attempts_pred") * pl.col("_scale")).alias("rush_attempts_pred"),
+                (pl.col("rush_yards_pred") * pl.col("_scale")).alias("rush_yards_pred"),
+                (pl.col("rush_tds_pred") * pl.col("_scale")).alias("rush_tds_pred"),
+                (pl.col("fantasy_points_pred") * pl.col("_scale")).alias("fantasy_points_pred"),
+            )
+            .drop(["_qb1_games", "_qb1_id", "_backup_total", "_residual", "_scale"])
+        )
+
     return QBProjection(qbs=all_qbs, league_means=means)

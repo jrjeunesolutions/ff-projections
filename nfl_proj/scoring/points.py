@@ -1665,6 +1665,91 @@ def project_fantasy_points(
         [vets_filtered, rooks_filtered, qbs], how="diagonal_relaxed"
     )
 
+    # POST-CONCAT QB TEAM-TOTAL CAP (added 2026-05-01). The qb.py module
+    # caps QB games per team, but only for QBs that flow through the QB
+    # pipeline (vets + 2025-or-earlier rookies with gsis_ids). Freshly-
+    # drafted 2026 rookies (Mendoza LV, Simpson LAR, Beck ARI, ...) are
+    # projected only by the rookie pipeline (no gsis_id yet → bypass
+    # qb.py) and arrive in `combined` with cohort-baseline games_pred
+    # (R1 ~10g) on top of the already-capped vet QB1. Sum exceeds 17
+    # without this second pass.
+    #
+    # Algorithm: for QB position only, identify QB1 per team (max
+    # games_pred), scale all non-QB1 QB rows so sum(non_QB1) ≤ 17 - QB1.
+    # Apply the scale to all games-scaled volume columns (games_pred,
+    # passing/rushing/receiving stats, fantasy_points_pred_qb).
+    qb_mask = pl.col("position") == "QB"
+    qb_only = combined.filter(qb_mask)
+    if qb_only.height > 0:
+        # Tag the team's QB1 (= row with highest games_pred per team) via
+        # a stable cumulative-rank, NOT player_id comparison. Newly drafted
+        # rookies often have null player_id (nflreadpy hasn't ingested
+        # them yet) so a player_id-based equality check is null-poisoned.
+        qb_only = qb_only.with_columns(
+            pl.col("games_pred")
+              .rank("ordinal", descending=True)
+              .over("team")
+              .alias("_team_qb_rank")
+        )
+        team_qb1_games = (
+            qb_only.filter(pl.col("_team_qb_rank") == 1)
+            .group_by("team")
+            .agg(pl.col("games_pred").first().alias("_qb1_games"))
+        )
+        team_backup_total = (
+            qb_only.filter(pl.col("_team_qb_rank") > 1)
+            .group_by("team")
+            .agg(pl.col("games_pred").sum().alias("_backup_total"))
+        )
+        scaled_qbs = (
+            qb_only.join(team_qb1_games, on="team", how="left")
+            .join(team_backup_total, on="team", how="left")
+            .with_columns(
+                pl.col("_qb1_games").fill_null(0.0),
+                pl.col("_backup_total").fill_null(0.0),
+            )
+            .with_columns(
+                pl.max_horizontal(
+                    pl.lit(0.0), pl.lit(SEASON_GAMES) - pl.col("_qb1_games")
+                ).alias("_residual"),
+            )
+            .with_columns(
+                # QB1 keeps games as-is; backups scale to fit residual.
+                pl.when(pl.col("_team_qb_rank") == 1)
+                .then(pl.lit(1.0))
+                .when(pl.col("_backup_total") > 0)
+                .then(
+                    pl.min_horizontal(
+                        pl.lit(1.0),
+                        pl.col("_residual") / pl.col("_backup_total"),
+                    )
+                )
+                .otherwise(pl.lit(1.0))
+                .alias("_scale"),
+            )
+        )
+        # Scale every games-scaled column. Conditional on column presence
+        # to handle the diagonal_relaxed concat schema (some cols missing
+        # from rookie or vet rows).
+        scale_cols = [
+            "games_pred", "targets_pred", "carries_pred",
+            "receptions_pred", "rec_yards_pred", "rush_yards_pred",
+            "rec_tds_pred", "rush_tds_pred", "fantasy_points_pred_qb",
+        ]
+        for c in scale_cols:
+            if c in scaled_qbs.columns:
+                scaled_qbs = scaled_qbs.with_columns(
+                    (pl.col(c) * pl.col("_scale")).alias(c)
+                )
+        scaled_qbs = scaled_qbs.drop([
+            "_team_qb_rank", "_qb1_games", "_backup_total", "_residual", "_scale",
+        ])
+        # Recombine: scaled QBs + non-QBs.
+        combined = pl.concat(
+            [combined.filter(~qb_mask), scaled_qbs],
+            how="diagonal_relaxed",
+        )
+
     # Apply baseline values (attach, don't filter — baseline may be null
     # for rookies without a prior season).
     baseline = player_prior_year_baseline(ctx).select(
