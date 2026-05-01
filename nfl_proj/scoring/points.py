@@ -187,6 +187,14 @@ def _current_season_active_player_ids(ctx: BacktestContext) -> set[str] | None:
             from datetime import date as _date
             year = _date.today().year
         rosters = nfl.load_rosters(seasons=[year])
+        # Filter out free-agent statuses (UFA, RFA). Players with these
+        # tags appear in the roster with their last team but aren't
+        # actually under contract — keeping them lets released vets
+        # (e.g. Joe Mixon UFA 2026) continue absorbing target/rush
+        # share. UDF and ACT remain — those are on rosters. Other
+        # statuses (RES/PUP/IR/IST/NWT) still play sometimes; keep them.
+        if "status" in rosters.columns:
+            rosters = rosters.filter(~pl.col("status").is_in(["UFA", "RFA"]))
         ids = (
             rosters.select("gsis_id")
             .drop_nulls("gsis_id")
@@ -194,6 +202,13 @@ def _current_season_active_player_ids(ctx: BacktestContext) -> set[str] | None:
             .get_column("gsis_id")
             .to_list()
         )
+        # Union in manual overrides — players the user has explicitly
+        # attested to being on a team (data/external/fa_signings_*.csv)
+        # bypass the UFA gate. Concrete case: J.K. Dobbins listed as
+        # UFA in nflreadpy 2026 roster but actually signed/retained
+        # by DEN.
+        from nfl_proj.data.team_assignment import manual_override_player_ids
+        ids = list(set(ids) | manual_override_player_ids(ctx.as_of_date))
         if not ids:
             return None
         return set(ids)
@@ -356,6 +371,51 @@ def _veteran_counting_stats(
             merged = merged.filter(
                 ~pl.col("player_id").is_in(rookie_pipeline_ids)
             )
+
+    # Depth-chart-aware share reordering. Within each (team, position)
+    # group, swap predicted target_share / rush_share so the
+    # depth-chart RB1 (or WR1, TE1) gets the highest predicted share,
+    # RB2 the second-highest, etc. Fixes offseason role changes that
+    # the prior-year-share Ridge can't see (Cam Skattebo NYG return
+    # from injury, David Montgomery HOU lead role, Omarion Hampton
+    # LAC sophomore lead, etc.). Players without depth-chart info
+    # are unaffected; magnitudes of the predicted shares are
+    # preserved — only the *assignment* changes.
+    # LIVE-MODE-ONLY: depth-chart-aware share reordering + games
+    # floor for depth-chart starters. Fixes the offseason-role-change
+    # cases the prior-year-share Ridge can't see (Skattebo NYG return
+    # from injury, Montgomery HOU lead role, Hampton LAC sophomore
+    # lead). These corrections rely on the *current* live depth
+    # chart published just before the upcoming season — applying
+    # them to historical backtest seasons would force preseason
+    # alignments that don't account for in-season injuries the
+    # backtest gets to use as ground truth, costing scoring lift.
+    # Detect live mode via target_season > most-recent-completed
+    # season (2025 as of 2026-05-01).
+    from datetime import date as _date
+    is_live_target = ctx.target_season > _date.today().year - 1
+    if is_live_target:
+        from nfl_proj.opportunity.depth_chart import (
+            apply_depth_chart_ceiling,
+            apply_depth_chart_floor,
+            apply_lead_starter_games_floor,
+            reorder_by_depth_chart,
+        )
+        # 1. Reorder shares so depth-chart RB1/WR1/TE1 has the highest
+        #    in-team share (handles offseason role changes).
+        merged = reorder_by_depth_chart(merged, ctx.target_season)
+        # 2. Floor lead-starter shares at position-typical minima
+        #    (handles injury-shortened priors that depress proven
+        #    starters — Garrett Wilson NYJ 12% target_share after
+        #    7-game 2025 should floor at 20% as WR1).
+        merged = apply_depth_chart_floor(merged, ctx.target_season)
+        # 3. Cap non-lead-starter shares at position-typical maxima
+        #    (handles share over-concentration — Hall 71% rush share
+        #    caps at 65%; Mason Taylor 13% TE2 caps at 8%).
+        merged = apply_depth_chart_ceiling(merged, ctx.target_season)
+        # 4. Floor games_pred for depth-chart-1 starters at full-health
+        #    levels (Skattebo 8.0 → 14.5).
+        merged = apply_lead_starter_games_floor(merged, ctx.target_season)
 
     # QB + rookie partitioning: compute per-team "vet-pool target ratio"
     # = 1 - qb_share - rookie_share. Vet shares should sum to this
@@ -859,7 +919,9 @@ def project_fantasy_points(
         )
     team = team or project_team_season(ctx)
     gamescript = gamescript or project_gamescript(ctx, team_result=team)
-    play_calling = play_calling or project_play_calling(ctx, team_result=team)
+    play_calling = play_calling or project_play_calling(
+        ctx, team_result=team, gamescript_games=gamescript.games
+    )
     opportunity = opportunity or project_opportunity(ctx)
     efficiency = efficiency or project_efficiency(ctx)
     availability = availability or project_availability(ctx)

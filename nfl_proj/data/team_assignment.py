@@ -96,12 +96,31 @@ def _normalise_team(team: str | None) -> str | None:
 
 @functools.lru_cache(maxsize=1)
 def _rosters_all() -> pl.DataFrame:
-    """Annual rosters across all available seasons."""
+    """Annual rosters across all available seasons.
+
+    Filters out free-agent statuses (UFA, RFA) — players with one of
+    those tags appear in the roster with their LAST team in the
+    ``team`` column, but they are no longer under contract there.
+    Treating UFA as "still on team" produces stale assignments
+    (Joe Mixon HOU 2026 after release). UDF (undrafted free agent
+    signings) and ACT remain: those players are on rosters.
+    """
     # Range must include the current calendar year so offseason moves
     # (e.g. Cousins → LV in March 2026) propagate before weekly rosters
     # populate at preseason. ``+1`` because Python ranges are exclusive.
     seasons = list(range(2015, date.today().year + 1))
     df = loaders.load_rosters(seasons)
+    if "status" in df.columns:
+        # Drop UFA/RFA, but exempt players with a manual override —
+        # the user's CSV attestation overrides the nflreadpy status.
+        override_ids = manual_override_player_ids()
+        if override_ids:
+            df = df.filter(
+                ~pl.col("status").is_in(["UFA", "RFA"])
+                | pl.col("gsis_id").is_in(list(override_ids))
+            )
+        else:
+            df = df.filter(~pl.col("status").is_in(["UFA", "RFA"]))
     return df.select(
         "season",
         pl.col("team"),
@@ -186,6 +205,26 @@ def clear_caches() -> None:
     _rosters_all.cache_clear()
     _rosters_weekly_all.cache_clear()
     _manual_overrides_all.cache_clear()
+
+
+def manual_override_player_ids(as_of: date | None = None) -> set[str]:
+    """
+    Return the set of player_ids that have a manual override active
+    on or before ``as_of``. These players are treated as ROSTERED
+    regardless of their nflreadpy ``status`` field — the override is
+    the user's explicit attestation that the player is on the team.
+
+    Used by active-roster filters (scoring/points,
+    opportunity/depth_chart, player/qb) to ensure manually-overridden
+    free agents (Dobbins DEN 2026 listed as UFA in nflreadpy but
+    actually under contract) aren't dropped by the UFA gate.
+    """
+    df = _manual_overrides_all()
+    if df.height == 0:
+        return set()
+    if as_of is not None:
+        df = df.filter(pl.col("effective_date") <= as_of)
+    return set(df.get_column("player_id").to_list())
 
 
 # ---------------------------------------------------------------------------

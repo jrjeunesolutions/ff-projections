@@ -174,11 +174,16 @@ def enrich_rookies(df: pl.DataFrame, season: int) -> pl.DataFrame:
     try:
         import nflreadpy as nfl
 
+        # Don't require gsis_id here — 2026 rookies are listed in the
+        # roster with their team and full_name but their gsis_id is
+        # often null until they appear in regular-season pbp. Filtering
+        # on gsis_id strips Cooper / Allen / etc. from the index and
+        # leaves their team null in the rookie projection.
         ros = (
             nfl.load_rosters(seasons=[season])
             .select("gsis_id", "full_name", "team", "position")
-            .drop_nulls(["gsis_id", "full_name"])
-            .unique(subset=["gsis_id"], keep="first")
+            .drop_nulls(["full_name"])
+            .unique(subset=["full_name"], keep="first")
         )
         for r in ros.iter_rows(named=True):
             key = _norm_name(r["full_name"])
