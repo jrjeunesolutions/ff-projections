@@ -41,6 +41,20 @@ _OC_HISTORY_CSV = (
 )
 
 
+# Distribution metric columns produced by ``build_oc_priors``. Listed once
+# here so callers (e.g. league-mean helpers) can iterate without
+# rebuilding the column list inline.
+_OC_METRIC_COLS: tuple[str, ...] = (
+    "oc_lead_wr_share",
+    "oc_lead_rb_rush_share",
+    "oc_te_pool_share",
+    "oc_lead_te_share",
+    "oc_lead_rb_target_share",
+    "oc_rb_pool_share",
+    "oc_pass_rate_prior",
+)
+
+
 # Minimum team-seasons of OC history needed to emit a prior. With < 2 seasons
 # the metric is mostly noise; better to fall back to league mean.
 _MIN_OC_SEASONS = 1
@@ -346,3 +360,31 @@ def build_oc_priors(ctx: BacktestContext) -> pl.DataFrame:
         )
     )
     return priors
+
+
+def build_league_means(
+    priors: pl.DataFrame,
+    metric_cols: tuple[str, ...] | None = None,
+) -> pl.DataFrame:
+    """
+    Per-season league means of the OC distribution priors.
+
+    Used by the opportunity model's interaction features to mean-centre
+    the OC priors against the season's actual league pool (each season
+    has a different mix of OCs as the chairs turn over).
+
+    Output schema::
+        season, mean_oc_lead_wr_share, mean_oc_lead_rb_rush_share, ...
+
+    ``metric_cols`` defaults to ``_OC_METRIC_COLS``; pass an explicit
+    subset to compute means for only the columns the caller cares about.
+    Missing columns are silently skipped.
+    """
+    cols = tuple(metric_cols) if metric_cols is not None else _OC_METRIC_COLS
+    available = [c for c in cols if c in priors.columns]
+    if not available:
+        return priors.select("season").unique()
+    return (
+        priors.group_by("season", maintain_order=True)
+        .agg(*[pl.col(c).mean().alias(f"mean_{c}") for c in available])
+    )

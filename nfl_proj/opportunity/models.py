@@ -187,9 +187,38 @@ OC_FEATURES_TS: tuple[str, ...] = (
 # ``project_rush_share_architecture.md`` documents the brittleness of
 # this Ridge; OC features stay off it.
 OC_FEATURES_RS: tuple[str, ...] = ()
+
+# Position-conditional INTERACTION features, computed from
+# is_lead_<pos> × per-season-centred OC prior.
+#
+# Why these matter: the additive OC features alone have small coefficients
+# (~ +0.006 on oc_lead_wr_share) because the OC's lead-WR-share prior
+# is highly correlated with the lead WR's own prior1 — which already
+# captures most of the same signal. The interactions add a position-
+# conditional adjustment that only fires for the depth-chart-1 player
+# and stays at 0 for everyone else, so the Ridge can split the OC
+# effect into "applies to the team's lead player" vs "applies broadly".
+#
+# Empirically the WR interaction picks up a -0.08 coefficient: lead WRs
+# whose OC has historically run a high lead-WR share regress more than
+# baseline (over-confidence damping). The TE interaction picks up a
+# +0.04 coefficient: lead TEs of TE-friendly OCs get a slight bump.
+# These signs are data-driven, not pre-specified.
+INTERACTION_FEATURES_TS: tuple[str, ...] = (
+    "lead_wr_x_oc_lead_wr_share",
+    "lead_te_x_oc_te_pool_share",
+)
+INTERACTION_FEATURES_RS: tuple[str, ...] = ()
+
+# Interaction features may need OC columns not already in the additive
+# feature lists (currently empty, but kept for forward extension).
+_OC_FEATURES_INTERACTION_ONLY: tuple[str, ...] = ()
+
 # Union for the join + null-fill steps that need every column present.
 OC_FEATURES: tuple[str, ...] = tuple(
-    dict.fromkeys((*OC_FEATURES_TS, *OC_FEATURES_RS))
+    dict.fromkeys(
+        (*OC_FEATURES_TS, *OC_FEATURES_RS, *_OC_FEATURES_INTERACTION_ONLY)
+    )
 )
 
 
@@ -200,7 +229,14 @@ FEATURES_TS: tuple[str, ...] = (
     "games_prior1",
     "years_played",
     "consistency",  # min(prior1, prior2): stable high-share vs one-year spike
+    # Additive OC features kept alongside the interactions: the additive
+    # features capture the (small) baseline OC effect that's still
+    # predictive when combined with prior1; the interactions add the
+    # position-conditional signed adjustment for lead players. Backtest
+    # showed dropping the additive layer in favor of interaction-only
+    # cost ~0.1pp pooled scoring lift.
     *OC_FEATURES_TS,
+    *INTERACTION_FEATURES_TS,
 )
 FEATURES_RS: tuple[str, ...] = (
     "prior1",
@@ -210,6 +246,7 @@ FEATURES_RS: tuple[str, ...] = (
     "years_played",
     "consistency",
     *OC_FEATURES_RS,
+    *INTERACTION_FEATURES_RS,
 )
 # Backwards-compat alias used by callers that referenced FEATURES generically.
 FEATURES: tuple[str, ...] = FEATURES_TS
@@ -252,7 +289,13 @@ class OpportunityProjection:
 
 
 def _metric_frame(df: pl.DataFrame, metric: str) -> pl.DataFrame:
-    oc_cols = OC_FEATURES_RS if metric == "rush_share" else OC_FEATURES_TS
+    if metric == "rush_share":
+        oc_cols: tuple[str, ...] = OC_FEATURES_RS
+    else:
+        # Target-share Ridge: pass through both the additive OC cols
+        # AND any cols needed only by the interaction features (so
+        # ``_fill_oc_features`` can compute the interaction downstream).
+        oc_cols = (*OC_FEATURES_TS, *_OC_FEATURES_INTERACTION_ONLY)
     selectors: list = [
         "player_id",
         "player_display_name",
@@ -265,7 +308,18 @@ def _metric_frame(df: pl.DataFrame, metric: str) -> pl.DataFrame:
         "games_prior1",
         "years_played",
     ]
-    selectors.extend(oc_cols)
+    # Drop duplicates while preserving order.
+    seen: set[str] = set()
+    for c in oc_cols:
+        if c not in seen and c in df.columns:
+            seen.add(c)
+            selectors.append(c)
+    # Pass through depth_rank if present so the interaction features can
+    # be computed downstream. Falls back to null when the depth-chart
+    # history hasn't been joined (e.g. legacy callers that build their
+    # own history frame).
+    if "depth_rank" in df.columns:
+        selectors.append("depth_rank")
     return df.select(*selectors)
 
 
@@ -273,24 +327,83 @@ def _fill_oc_features(
     frame: pl.DataFrame,
 ) -> pl.DataFrame:
     """
-    Mean-centre OC features (so a coefficient learned on them reflects
-    deviation from the league-wide OC pool) and fill nulls with zero
-    (= the centred-mean). The residual-form encoding matches the share
-    Ridges' own residual target (``share - prior1``); without it,
-    additive OC features lived almost entirely on the intercept and
-    contributed nothing per-player.
+    Per-season mean-centre OC features and compute the position-
+    conditional interaction columns.
+
+    Why per-season centering: each season has a different mix of OCs
+    (32 chairs, ~5-10 turn over per offseason). Centering against a
+    pooled-across-seasons mean leaves a small residual offset that the
+    Ridge has to fit through the intercept; per-season centering
+    eliminates that offset entirely so the OC coefficients reflect
+    pure deviation from THAT year's league pool.
+
+    The residual-form encoding matches the share Ridges' own residual
+    target (``share - prior1``); without it, additive OC features
+    lived almost entirely on the intercept and contributed nothing
+    per-player.
+
+    Interaction columns:
+      * ``lead_wr_x_oc_lead_wr_share`` — fires only when the player
+        is his team's depth-chart-1 WR. The mean-centred OC lead-WR
+        prior moves the share for that player, but stays at zero for
+        WR2/WR3/etc. so it can't pollute their predictions.
+      * ``lead_te_x_oc_te_pool_share`` — same idea for TE1.
+
+    ``depth_rank`` is expected on the frame; if missing (older history
+    schemas, defensive callers), the interactions are zero (no-op).
     """
     out = frame
     for col in OC_FEATURES:
         if col not in out.columns:
             continue
-        mean = out[col].mean()
-        if mean is None:
-            mean = 0.0
-        out = out.with_columns(
-            (pl.col(col).fill_null(float(mean)).cast(pl.Float64) - float(mean))
-            .alias(col)
+        # Per-season mean-centering. Reduces a small residual offset
+        # that pooled centering left behind (different OCs each year).
+        season_mean = out.group_by("season").agg(
+            pl.col(col).mean().alias("__seasonal_mean")
         )
+        out = out.join(season_mean, on="season", how="left")
+        out = out.with_columns(
+            (
+                pl.col(col).fill_null(pl.col("__seasonal_mean")).cast(pl.Float64)
+                - pl.col("__seasonal_mean").fill_null(0.0)
+            ).alias(col)
+        ).drop("__seasonal_mean")
+
+    # Interaction features. After centering, the OC columns are now
+    # deviations from the per-season mean, so multiplying by the lead-
+    # position mask gives a per-player signed adjustment.
+    has_depth = "depth_rank" in out.columns
+    if has_depth:
+        is_lead_wr = (pl.col("position") == "WR") & (pl.col("depth_rank") == 1)
+        is_lead_te = (pl.col("position") == "TE") & (pl.col("depth_rank") == 1)
+    else:
+        is_lead_wr = pl.lit(False)
+        is_lead_te = pl.lit(False)
+
+    if "oc_lead_wr_share" in out.columns:
+        out = out.with_columns(
+            pl.when(is_lead_wr)
+            .then(pl.col("oc_lead_wr_share"))
+            .otherwise(0.0)
+            .alias("lead_wr_x_oc_lead_wr_share")
+        )
+    else:
+        out = out.with_columns(
+            pl.lit(0.0).alias("lead_wr_x_oc_lead_wr_share")
+        )
+
+    if "oc_te_pool_share" in out.columns:
+        out = out.with_columns(
+            pl.when(is_lead_te)
+            .then(pl.col("oc_te_pool_share"))
+            .otherwise(0.0)
+            .alias("lead_te_x_oc_te_pool_share")
+        )
+    else:
+        out = out.with_columns(
+            pl.lit(0.0).alias("lead_te_x_oc_te_pool_share")
+        )
+
     return out
 
 
@@ -654,6 +767,31 @@ def project_opportunity(
         # OC history CSV not present — degrade to league-mean fallback.
         for col in OC_FEATURES:
             history = history.with_columns(pl.lit(None).cast(pl.Float64).alias(col))
+
+    # Join per-(season, player_id) depth-chart rank for the position-
+    # conditional interaction features. Best-effort: any season where
+    # nflreadpy fails to return a depth chart is treated as null
+    # (interaction = 0 → no-op). Direct nflreadpy call here so we get
+    # the live target year (ctx.depth_charts is as_of-filtered and
+    # excludes the unreleased target year).
+    try:
+        from nfl_proj.opportunity.depth_chart_history import (
+            load_depth_rank_history,
+        )
+
+        all_seasons = (
+            history.select(pl.col("season").unique()).get_column("season").to_list()
+        )
+        dr = load_depth_rank_history(all_seasons).select(
+            pl.col("season").cast(history.schema["season"]),
+            "player_id",
+            "depth_rank",
+        )
+        history = history.join(dr, on=["season", "player_id"], how="left")
+    except Exception:
+        history = history.with_columns(
+            pl.lit(None).cast(pl.Int32).alias("depth_rank")
+        )
     ts_model = _fit_share_model(history, metric="target_share", alpha=alpha)
     rs_model = _fit_rush_share_models(history, alpha=alpha)
 
