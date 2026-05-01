@@ -321,6 +321,34 @@ def _veteran_counting_stats(
             before_n - merged.height, before_n,
         )
 
+    # PRE-NORMALIZATION DEDUP: drop player_ids that will come from the
+    # QB or rookie pipelines downstream. Without this, the share
+    # normalization allocates residual to players who later get
+    # filtered out by the dedup in ``project_fantasy_points`` — their
+    # share is consumed but their carries vanish, leaving vets short.
+    # Concrete case: BUF Josh Allen has both a vet-pipeline rush share
+    # AND a QB-pipeline projection. If we let the vet pipeline allocate
+    # ~67 carries to him then dedup him out and replace with the QB
+    # projection's 99, those 67 vet-allocated carries don't redistribute
+    # to Cook / Davis — they just disappear (BUF rush coverage = 86%
+    # instead of 100%). Filtering them out PRE-normalization means the
+    # residual fully redistributes to non-QB-pipeline vets.
+    if qb is not None and qb.qbs.height > 0:
+        qb_pipeline_ids = (
+            qb.qbs.select("player_id").drop_nulls().to_series().to_list()
+        )
+        if qb_pipeline_ids:
+            merged = merged.filter(~pl.col("player_id").is_in(qb_pipeline_ids))
+    if rookies is not None and rookies.projections.height > 0:
+        rookie_pipeline_ids = (
+            rookies.projections.select("player_id").drop_nulls()
+            .to_series().to_list()
+        )
+        if rookie_pipeline_ids:
+            merged = merged.filter(
+                ~pl.col("player_id").is_in(rookie_pipeline_ids)
+            )
+
     # QB + rookie partitioning: subtract per-team QB rush attempts and
     # rookie targets/carries from team volumes so veteran shares only
     # allocate what's left. Without this step:
@@ -396,51 +424,56 @@ def _veteran_counting_stats(
         pl.col("rush_share_pred").fill_null(0.0),
     )
 
-    # PER-TEAM SHARE NORMALIZATION (added 2026-04-30): the share model
-    # predicts each player's share independently using their *prior team's*
-    # historical context, then we re-attribute them to their as_of team.
-    # Result: per-team sums of target_share + rush_share don't add up
-    # to 1.0 — over-attribution when multiple players bring high prior
-    # shares to the same new team (e.g. HOU 132% post-active-filter,
-    # because new RBs all carry Y-1 shares from prior teams), and
-    # under-attribution when a team's depth chart is thin or rookie-
-    # heavy (JAX 50% — only Tuten with thin Y-1 sample).
+    # PER-TEAM AVAILABILITY-WEIGHTED SHARE NORMALIZATION
+    # (added 2026-04-30, revised 2026-04-30):
     #
-    # Renormalizing each team's predicted shares to sum to exactly 1.0
-    # corrects both directions: over-attributed teams are scaled down so
-    # phantom contributions don't double-count, under-attributed teams
-    # are scaled up so the lead back actually projects as the lead back
-    # (Tuten's 16% share scales to ~32% when he's the team's only
-    # qualifying RB). Done before games_scalar so partial-season
-    # availability is still honored on top of the corrected shares.
-    team_share_totals = merged.group_by("team").agg(
-        pl.col("target_share_pred").sum().alias("team_ts_total"),
-        pl.col("rush_share_pred").sum().alias("team_rs_total"),
-    )
-    merged = merged.join(team_share_totals, on="team", how="left")
+    # The share model predicts each player's share independently using
+    # their *prior team's* historical context, then we re-attribute them
+    # to their as_of team. Two corrections happen here in one pass:
+    #
+    #   (1) Per-team share renormalization (original v1):
+    #       Without it, predicted shares per team sum anywhere from 50%
+    #       (rookie-heavy thin teams) to 132% (offseason-roster-shuffle
+    #       teams). Renormalizing makes per-team share sum exactly 1.0.
+    #
+    #   (2) Availability-weighted redistribution (new 2026-04-30 v2):
+    #       Multiplying share × games_scalar AFTER normalization gives
+    #       team totals well below team_volume because games_scalar < 1
+    #       drags every player's projection down. Real-life NFL doesn't
+    #       work that way: when the starter misses 3 games, his carries
+    #       go to the BACKUP, not vanish. This redistribution is what
+    #       was producing the 60-87% rush coverage.
+    #
+    #       Fix: define each player's weight as (share × games_scalar)
+    #       and normalize the WEIGHTS to sum to 1.0 per team. Healthy
+    #       teammates pick up the slack of injured ones in proportion to
+    #       their predicted shares. After this, per-team Σ(targets_pred)
+    #       = team_targets and Σ(carries_pred) = team_carries (exactly,
+    #       up to floating point) — the residual volume after QB+rookie
+    #       partitioning is fully attributed to vets.
     merged = merged.with_columns(
-        pl.when(pl.col("team_ts_total") > 0)
-        .then(pl.col("target_share_pred") / pl.col("team_ts_total"))
-        .otherwise(pl.col("target_share_pred"))
-        .alias("target_share_pred"),
-        pl.when(pl.col("team_rs_total") > 0)
-        .then(pl.col("rush_share_pred") / pl.col("team_rs_total"))
-        .otherwise(pl.col("rush_share_pred"))
-        .alias("rush_share_pred"),
-    ).drop(["team_ts_total", "team_rs_total"])
-
+        (pl.col("target_share_pred") * pl.col("games_scalar")).alias("_t_w"),
+        (pl.col("rush_share_pred") * pl.col("games_scalar")).alias("_r_w"),
+    )
+    team_weights = merged.group_by("team").agg(
+        pl.col("_t_w").sum().alias("_team_t_w"),
+        pl.col("_r_w").sum().alias("_team_r_w"),
+    )
+    merged = merged.join(team_weights, on="team", how="left")
     merged = merged.with_columns(
         (
             pl.col("team_targets")
-            * pl.col("target_share_pred")
-            * pl.col("games_scalar")
+            * pl.when(pl.col("_team_t_w") > 0)
+              .then(pl.col("_t_w") / pl.col("_team_t_w"))
+              .otherwise(0.0)
         ).alias("targets_pred"),
         (
             pl.col("team_carries")
-            * pl.col("rush_share_pred")
-            * pl.col("games_scalar")
+            * pl.when(pl.col("_team_r_w") > 0)
+              .then(pl.col("_r_w") / pl.col("_team_r_w"))
+              .otherwise(0.0)
         ).alias("carries_pred"),
-    )
+    ).drop(["_t_w", "_r_w", "_team_t_w", "_team_r_w"])
 
     # Catch rate lookup
     cr = pl.DataFrame(
