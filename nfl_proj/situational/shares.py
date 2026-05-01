@@ -161,6 +161,44 @@ def project_zone_shares(ctx: BacktestContext) -> ZoneShareProjection:
             schema={"player_id": pl.String}
         )
     else:
+        # MID-SEASON-TRADE COLLAPSE (added 2026-05-01).
+        # ``player_season_zone_targets`` keys on (player, season,
+        # posteam) so a mid-season-traded player produces multiple
+        # rows for the same prior season (e.g. Adonai Mitchell 2025:
+        # one IND row + one NYJ row). Without collapsing, both rows
+        # flow through the join and produce duplicate per-player
+        # entries in zone_shares output → duplicate rec_tds in the
+        # final players frame. Sum zone counts per (player_id, season),
+        # picking the dominant team (where they had the most targets)
+        # as the team-context for the share denominator.
+        if "posteam" in pz_t_prior.columns:
+            dominant_team = (
+                pz_t_prior.with_columns(
+                    (
+                        pl.col("targets_inside_5")
+                        + pl.col("targets_inside_10")
+                        + pl.col("targets_rz_outside_10")
+                        + pl.col("targets_open")
+                    ).alias("_t_per_team")
+                )
+                .sort("_t_per_team", descending=True)
+                .group_by(["player_id", "season"], maintain_order=True)
+                .first()
+                .select("player_id", "season", pl.col("posteam").alias("_dom_team"))
+            )
+            pz_t_prior = pz_t_prior.group_by(
+                ["player_id", "season"]
+            ).agg(
+                pl.col("targets_inside_5").sum(),
+                pl.col("targets_inside_10").sum(),
+                pl.col("targets_rz_outside_10").sum(),
+                pl.col("targets_open").sum(),
+                pl.col("explosive_targets").sum(),
+                pl.col("air_yards_sum").sum(),
+            ).join(dominant_team, on=["player_id", "season"], how="left").rename(
+                {"_dom_team": "posteam"}
+            )
+
         # Player overall prior1 target_share = sum(targets across zones) /
         # team overall pass attempts.
         pz_t_prior = pz_t_prior.with_columns(
@@ -222,6 +260,36 @@ def project_zone_shares(ctx: BacktestContext) -> ZoneShareProjection:
             schema={"player_id": pl.String}
         )
     else:
+        # Same mid-season-trade collapse as targets above.
+        if "posteam" in pz_r_prior.columns:
+            dominant_team_r = (
+                pz_r_prior.with_columns(
+                    (
+                        pl.col("carries_inside_5")
+                        + pl.col("carries_inside_10")
+                        + pl.col("carries_rz_outside_10")
+                        + pl.col("carries_open")
+                    ).alias("_c_per_team")
+                )
+                .sort("_c_per_team", descending=True)
+                .group_by(["player_id", "season"], maintain_order=True)
+                .first()
+                .select("player_id", "season", pl.col("posteam").alias("_dom_team"))
+            )
+            agg_cols = [
+                pl.col("carries_inside_5").sum(),
+                pl.col("carries_inside_10").sum(),
+                pl.col("carries_rz_outside_10").sum(),
+                pl.col("carries_open").sum(),
+            ]
+            if "explosive_runs" in pz_r_prior.columns:
+                agg_cols.append(pl.col("explosive_runs").sum())
+            pz_r_prior = pz_r_prior.group_by(
+                ["player_id", "season"]
+            ).agg(*agg_cols).join(
+                dominant_team_r, on=["player_id", "season"], how="left"
+            ).rename({"_dom_team": "posteam"})
+
         pz_r_prior = pz_r_prior.with_columns(
             (
                 pl.col("carries_inside_5")

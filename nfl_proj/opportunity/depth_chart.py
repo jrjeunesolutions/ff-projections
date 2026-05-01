@@ -173,8 +173,105 @@ def load_starter_depth_chart(season: int) -> pl.DataFrame:
     return out
 
 
+# Threshold for "healthy" prior season — used by the player-specific
+# historical-peak floor below. A season with games < 14 is treated as
+# injury-affected and excluded from the player's healthy-peak share
+# aggregate.
+HEALTHY_GAMES_THRESHOLD: int = 14
+
+
+def _player_healthy_peak_shares(
+    history: pl.DataFrame,
+    target_season: int,
+) -> pl.DataFrame:
+    """
+    Per-player MEAN PER-GAME share over the last 3 prior seasons —
+    properly accounting for games missed.
+
+    The naive "mean of season target_share" is misleading because a
+    7-game injury year is computed against the team's FULL-season
+    targets denominator, mathematically depressing the player's
+    season share even if his per-game pace was unchanged. Wilson's
+    2025 was 59 targets in 7 games — per-game pace 8.4 tgts/g, in
+    line with his 9.0 tgts/g career average — but his season share
+    (59/492 = 0.120) is well below his healthy-pace share.
+
+    The fix: compute per-game share for each season as
+        per_game_share = (player_targets / player_games)
+                       / (team_targets / 17)
+    A 7-game injury year and a 17-game healthy year produce the same
+    per_game_share when the player's per-game pace was unchanged.
+    Then average across the last 3 prior seasons.
+
+    Concrete (Wilson 2023-2025):
+      2023 (17g, 168/540): per_game = 168/17 / (540/17) = 0.311
+      2024 (17g, 153/629): per_game = 153/17 / (629/17) = 0.243
+      2025 (7g,   59/492): per_game =  59/ 7 / (492/17) = 0.291
+      mean = 0.282  (vs 0.269 mean-of-season-shares — lifts injury years)
+
+    Returns: (player_id, healthy_peak_target_share, healthy_peak_rush_share).
+    Column names retained for compatibility with the original
+    MAX-based implementation; the values are now means.
+    """
+    if history.height == 0 or "season" not in history.columns:
+        return pl.DataFrame(
+            schema={
+                "player_id": pl.String,
+                "healthy_peak_target_share": pl.Float64,
+                "healthy_peak_rush_share": pl.Float64,
+            }
+        )
+    LOOKBACK_SEASONS = 3
+    SEASON_GAMES = 17
+    recent = (
+        history.filter(pl.col("season") < target_season)
+        .filter(pl.col("games") > 0)
+        .sort("season", descending=True)
+        .group_by("player_id", maintain_order=True)
+        .head(LOOKBACK_SEASONS)
+    )
+    if recent.height == 0:
+        return pl.DataFrame(
+            schema={
+                "player_id": pl.String,
+                "healthy_peak_target_share": pl.Float64,
+                "healthy_peak_rush_share": pl.Float64,
+            }
+        )
+    # Compute per-game share per season.
+    pg_cols = []
+    if "target_share" in recent.columns and "team_targets" in recent.columns:
+        recent = recent.with_columns(
+            pl.when(pl.col("team_targets") > 0)
+              .then(
+                  (pl.col("targets") / pl.col("games"))
+                  / (pl.col("team_targets") / SEASON_GAMES)
+              )
+              .otherwise(pl.lit(None))
+              .alias("_pg_target_share"),
+        )
+        pg_cols.append(
+            pl.col("_pg_target_share").mean().alias("healthy_peak_target_share")
+        )
+    if "rush_share" in recent.columns and "team_carries" in recent.columns:
+        recent = recent.with_columns(
+            pl.when(pl.col("team_carries") > 0)
+              .then(
+                  (pl.col("carries") / pl.col("games"))
+                  / (pl.col("team_carries") / SEASON_GAMES)
+              )
+              .otherwise(pl.lit(None))
+              .alias("_pg_rush_share"),
+        )
+        pg_cols.append(
+            pl.col("_pg_rush_share").mean().alias("healthy_peak_rush_share")
+        )
+    return recent.group_by("player_id").agg(*pg_cols)
+
+
 def apply_depth_chart_floor(
-    merged: pl.DataFrame, season: int
+    merged: pl.DataFrame, season: int,
+    history: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """Apply ``STARTER_FLOOR`` to predicted shares in-place.
 
@@ -211,7 +308,7 @@ def apply_depth_chart_floor(
 
     dc_with_floor = dc.join(
         floor_df, on=["depth_position", "depth_rank"], how="inner"
-    ).select("player_id", "team", "_target_floor", "_rush_floor")
+    ).select("player_id", "team", "depth_rank", "_target_floor", "_rush_floor")
 
     # Validate the player's as_of team matches the depth-chart team
     # (otherwise the floor doesn't transfer — e.g., a player who was a
@@ -224,6 +321,47 @@ def apply_depth_chart_floor(
         pl.col("_target_floor").fill_null(0.0),
         pl.col("_rush_floor").fill_null(0.0),
     )
+
+    # PLAYER-SPECIFIC HEALTHY-PEAK FLOOR (added 2026-05-01).
+    # For depth-chart-1 alphas, raise the floor to the player's max
+    # share from healthy prior seasons (games >= 14). Garrett Wilson
+    # NYJ was hitting only 23% target_share via the league-typical
+    # WR1 floor, but his healthy peak was 31.1% in 2023. The proven
+    # alpha share is the right floor for confirmed healthy depth-
+    # chart-1 starters, not the league-typical WR1 minimum (which is
+    # tuned for new starters and post-injury cases).
+    #
+    # When ``history`` is None (caller didn't provide), this layer is
+    # a no-op and the position-typical floor stays in effect.
+    if history is not None:
+        peaks = _player_healthy_peak_shares(history, season)
+        if peaks.height > 0:
+            merged = merged.join(peaks, on="player_id", how="left").with_columns(
+                pl.col("healthy_peak_target_share").fill_null(0.0),
+                pl.col("healthy_peak_rush_share").fill_null(0.0),
+            ).with_columns(
+                # Only depth-chart-1 starters get the player-specific
+                # peak floor; depth-chart-2/3 keep the position-
+                # typical floor.
+                pl.when(pl.col("depth_rank") == 1)
+                  .then(
+                      pl.max_horizontal(
+                          pl.col("_target_floor"),
+                          pl.col("healthy_peak_target_share"),
+                      )
+                  )
+                  .otherwise(pl.col("_target_floor"))
+                  .alias("_target_floor"),
+                pl.when(pl.col("depth_rank") == 1)
+                  .then(
+                      pl.max_horizontal(
+                          pl.col("_rush_floor"),
+                          pl.col("healthy_peak_rush_share"),
+                      )
+                  )
+                  .otherwise(pl.col("_rush_floor"))
+                  .alias("_rush_floor"),
+            ).drop(["healthy_peak_target_share", "healthy_peak_rush_share"])
 
     # Apply floors. Track whether the floor raised the prediction, so
     # we can mark those as floor_bound for elite protection.

@@ -662,7 +662,13 @@ def _veteran_counting_stats(
         #    (handles injury-shortened priors that depress proven
         #    starters — Garrett Wilson NYJ 12% target_share after
         #    7-game 2025 should floor at 20% as WR1).
-        merged = apply_depth_chart_floor(merged, ctx.target_season)
+        # Pass history so apply_depth_chart_floor can compute the
+        # player-specific per-game share floor (proven alphas like
+        # Garrett Wilson floor at their per-game-share mean from
+        # last 3 seasons, not the league-typical WR1 0.23 floor).
+        merged = apply_depth_chart_floor(
+            merged, ctx.target_season, history=history,
+        )
         # 3. Cap non-lead-starter shares at position-typical maxima
         #    (handles share over-concentration — Hall 71% rush share
         #    caps at 65%; Mason Taylor 13% TE2 caps at 8%).
