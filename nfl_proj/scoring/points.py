@@ -182,6 +182,7 @@ def _team_volumes(
     *,
     ctx: BacktestContext | None = None,
     zone_fractions: dict[str, float] | None = None,
+    gamescript_games: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """
     (team, season=tgt) -> team_targets, team_carries.
@@ -209,7 +210,8 @@ def _team_volumes(
     )
     if ctx is not None:
         merged = project_team_zone_volumes(
-            ctx, merged, fractions=zone_fractions
+            ctx, merged, fractions=zone_fractions,
+            gamescript_games=gamescript_games,
         )
     return merged
 
@@ -1262,6 +1264,7 @@ def project_fantasy_points(
 
     team_vol = _team_volumes(
         team, play_calling, ctx=ctx, zone_fractions=zone_fractions,
+        gamescript_games=gamescript.games if gamescript is not None else None,
     )
     vets = _veteran_counting_stats(
         ctx, team_vol, opportunity, efficiency, availability,
@@ -1301,6 +1304,50 @@ def project_fantasy_points(
     combined = pl.concat(
         [vets_filtered, rooks_filtered, qbs], how="diagonal_relaxed"
     )
+
+    # QB pass_td COUPLING (added 2026-05-01): each QB's effective pass
+    # TDs should equal the sum of his team's receiver / rookie rec_tds —
+    # every receiving TD is also a passing TD, by definition. Without
+    # coupling, the QB's pass_td_rate is fit independently from the
+    # blended-zone receiver TDs, so the two diverge (e.g. NYJ team rec
+    # TDs sum to ~22 but Geno's flat-rate pass_tds projects ~17).
+    # Recompute fantasy_points_pred_qb by adjusting for the delta:
+    #   delta_pass_tds = team_rec_tds_sum − qb_original_pass_tds
+    #   fantasy_points_pred_qb += PPR_QB.pass_tds (= 4.0) × delta
+    # This snaps QB pass TDs to the team aggregate while preserving
+    # everything else in the QB scoring stack (yards, INTs, rush).
+    if qb.qbs.height > 0:
+        from nfl_proj.player.qb import PPR_QB
+        team_rec_tds = (
+            pl.concat([vets_filtered, rooks_filtered], how="diagonal_relaxed")
+            .filter(pl.col("team").is_not_null())
+            .group_by("team")
+            .agg(
+                pl.col("rec_tds_pred").fill_null(0.0).sum()
+                .alias("team_rec_tds_pred_for_coupling")
+            )
+        )
+        qb_orig_pass_tds = qb.qbs.select(
+            "player_id",
+            pl.col("pass_tds_pred").alias("_orig_pass_tds_pred"),
+        )
+        combined = combined.join(
+            team_rec_tds, on="team", how="left"
+        ).join(
+            qb_orig_pass_tds, on="player_id", how="left"
+        ).with_columns(
+            # Only adjust QB rows (those with non-null _orig_pass_tds_pred).
+            pl.when(pl.col("_orig_pass_tds_pred").is_not_null())
+            .then(
+                pl.col("fantasy_points_pred_qb")
+                + PPR_QB["pass_tds"] * (
+                    pl.col("team_rec_tds_pred_for_coupling").fill_null(0.0)
+                    - pl.col("_orig_pass_tds_pred")
+                )
+            )
+            .otherwise(pl.col("fantasy_points_pred_qb"))
+            .alias("fantasy_points_pred_qb"),
+        ).drop(["team_rec_tds_pred_for_coupling", "_orig_pass_tds_pred"])
 
     # Apply baseline values (attach, don't filter — baseline may be null
     # for rookies without a prior season).
