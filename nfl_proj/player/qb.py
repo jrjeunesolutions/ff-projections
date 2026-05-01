@@ -721,37 +721,65 @@ def project_qb(
         pl.col("games_pred").fill_null(float(SEASON_GAMES)),
     )
 
-    # LIVE-MODE-ONLY depth-chart-1 QB games floor (added 2026-05-01):
-    # Mirrors apply_lead_starter_games_floor for skill positions but
-    # applied here in the QB module so it fires BEFORE pass_attempts_pred
-    # is computed (downstream pass_attempts = team_att × qb_share ×
-    # games_scalar; if we floor games_pred only after, the volume math
-    # is locked at the lower games count). Concrete fix: Jayden Daniels
-    # (depth-chart QB1 on WAS) had games_pred=10.7 after his 7-game
-    # 2025 dragged the recency-weighted availability mean down. Floor
-    # at 15.5 (typical healthy QB1 games) lifts him to projected
-    # full-season volume. Same gating as the rest of the depth-chart
-    # override system: target_season > today.year - 1.
+    # LIVE-MODE-ONLY depth-chart-aware QB games allocation
+    # (added 2026-05-01, extended same day).
+    #
+    # Two coupled effects:
+    #
+    # (1) DEPTH-CHART-1 GAMES FLOOR. Mirrors
+    #     apply_lead_starter_games_floor for skill positions but
+    #     applied here in the QB module so it fires BEFORE
+    #     pass_attempts_pred is computed. Floors depth-chart QB1
+    #     games_pred at LEAD_STARTER_GAMES_FLOOR['QB'] (=15.5).
+    #     Concrete: Daniels WAS games_pred 10.7 -> 15.5 (his 2025
+    #     7-game year dragged the recency-weighted availability
+    #     model down despite him being a healthy depth-chart QB1).
+    #
+    # (2) TEAM-CONSTRAINED ALLOCATION FOR QB2+ (per user spec
+    #     2026-05-01 "probabilities for QB1 and QB2"). The
+    #     availability model treats each QB independently, using
+    #     the QB's HISTORICAL games-played as a starter — so a
+    #     player like Justin Fields (KC QB2 in 2026) keeps a
+    #     games_pred of ~10 because his 2024 PIT and 2025 NYJ
+    #     starter histories showed 9-10 games each. That's wrong:
+    #     on KC he's Mahomes' backup, and Mahomes' 16+ games leaves
+    #     room for at most 1-2 backup starts.
+    #
+    #     Joint model:
+    #         p_QB1 = max(QB1_avail_rate, depth_chart_floor / 17)
+    #         p_QB2 = QB2's individual avail rate (games_pred / 17)
+    #         games[QB1] = 17 × p_QB1
+    #         games[QB2] = 17 × (1 - p_QB1) × p_QB2
+    #
+    #     Probability QB2 plays = P(QB1 doesn't play AND QB2 healthy).
+    #     By construction the team total is at most 17 games (could
+    #     be slightly less if both QBs have substantial injury risk;
+    #     that's correct — there's some probability NEITHER plays
+    #     in a given week, in which case QB3 starts). QB3+ get a
+    #     residual share of (1 - p_QB1) × (1 - p_QB2) per game,
+    #     capped at a small floor (~0.5 games) since QB3 starts are
+    #     rare; usually QB3 only plays in mop-up duty.
     from datetime import date as _date_qb
     if ctx.target_season > _date_qb.today().year - 1:
         from nfl_proj.opportunity.depth_chart import (
             LEAD_STARTER_GAMES_FLOOR, load_starter_depth_chart,
         )
         qb_games_floor = float(LEAD_STARTER_GAMES_FLOOR.get("QB", 0.0))
-        if qb_games_floor > 0:
-            dc = load_starter_depth_chart(ctx.target_season)
-            if dc.height > 0:
-                qb1_ids = dc.filter(
-                    (pl.col("depth_position") == "QB")
-                    & (pl.col("depth_rank") == 1)
-                ).select("player_id", "team")
-                merged = merged.join(
-                    qb1_ids.with_columns(pl.lit(True).alias("_is_qb1")),
-                    on=["player_id", "team"], how="left",
-                ).with_columns(
-                    pl.col("_is_qb1").fill_null(False),
-                ).with_columns(
-                    pl.when(pl.col("_is_qb1"))
+        dc = load_starter_depth_chart(ctx.target_season)
+        if dc.height > 0:
+            # Join depth_rank for ALL QBs (rank 1, 2, 3+) — was
+            # previously joining only QB1 ids.
+            qb_dc = dc.filter(pl.col("depth_position") == "QB").select(
+                "player_id", "team", "depth_rank",
+            )
+            merged = merged.join(
+                qb_dc, on=["player_id", "team"], how="left",
+            )
+
+            # Step 1: floor QB1 games at the depth-chart floor.
+            if qb_games_floor > 0:
+                merged = merged.with_columns(
+                    pl.when(pl.col("depth_rank") == 1)
                       .then(
                           pl.max_horizontal(
                               pl.col("games_pred"),
@@ -760,7 +788,48 @@ def project_qb(
                       )
                       .otherwise(pl.col("games_pred"))
                       .alias("games_pred"),
-                ).drop("_is_qb1")
+                )
+
+            # Step 2: team-constrained joint allocation. Compute
+            # p_QB1 from each team's QB1 floored games_pred; apply
+            # joint probability formula to QB2 and below.
+            qb1_rates = (
+                merged.filter(pl.col("depth_rank") == 1)
+                .group_by("team")
+                .agg(
+                    (pl.col("games_pred").first() / SEASON_GAMES)
+                      .clip(0.0, 1.0)
+                      .alias("_p_qb1")
+                )
+            )
+            merged = merged.join(qb1_rates, on="team", how="left").with_columns(
+                # Default p_qb1 = 1.0 for teams without a QB1 in
+                # the depth chart (no over-allocation possible).
+                pl.col("_p_qb1").fill_null(1.0),
+            ).with_columns(
+                # Each QB's individual availability rate.
+                (pl.col("games_pred") / SEASON_GAMES)
+                    .clip(0.0, 1.0).alias("_avail_rate"),
+            ).with_columns(
+                pl.when(pl.col("depth_rank") == 1)
+                  .then(pl.col("games_pred"))
+                  .when(pl.col("depth_rank") == 2)
+                  .then(
+                      # E[QB2 games] = 17 × (1 - p_qb1) × p_qb2
+                      SEASON_GAMES
+                      * (1.0 - pl.col("_p_qb1"))
+                      * pl.col("_avail_rate")
+                  )
+                  .when(pl.col("depth_rank") >= 3)
+                  # QB3+ usually only plays in mop-up. Keep a
+                  # small games_pred floor (0.3) so they exist in
+                  # the projection but don't accumulate volume.
+                  .then(pl.lit(0.3))
+                  # QBs not on depth chart (off-roster or rare):
+                  # keep their availability-model value as-is.
+                  .otherwise(pl.col("games_pred"))
+                  .alias("games_pred"),
+            ).drop(["_p_qb1", "_avail_rate", "depth_rank"])
 
     merged = merged.with_columns(
         (pl.col("games_pred") / SEASON_GAMES).alias("games_scalar"),
