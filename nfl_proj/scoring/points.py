@@ -74,6 +74,18 @@ from nfl_proj.play_calling.models import (
 )
 from nfl_proj.player.qb import QBProjection, project_qb
 from nfl_proj.rookies.models import RookieProjection, project_rookies
+from nfl_proj.situational.aggregator import (
+    ZONE_NAMES,
+    league_zone_td_rates,
+)
+from nfl_proj.situational.shares import (
+    ZoneShareProjection,
+    project_zone_shares,
+)
+from nfl_proj.situational.team_volumes import (
+    league_zone_fractions,
+    project_team_zone_volumes,
+)
 from nfl_proj.team.features import TEAM_NORMALIZATION
 from nfl_proj.team.models import TeamProjection, project_team_season
 
@@ -90,6 +102,40 @@ PPR: dict[str, float] = {
     "rush_yards": 0.1,
     "rush_tds":   6.0,
 }
+
+# ---------------------------------------------------------------------------
+# Blended (multi-zone) TD model — config flag.
+#
+# When True, ``rec_tds_pred`` and ``rush_tds_pred`` are computed as a
+# blend over zones:
+#
+#   tds_pred = Σ over zones { player_zone_share × team_zone_volume × zone_td_rate }
+#
+# This captures role specialization (goal-line vs. open-field) and
+# air-yards-driven explosive-play TDs, which the flat ``rate × volume``
+# path averages out. Each historical TD is uniquely attributed to the
+# zone the play started in (by ``yardline_100``) so league-wide per-zone
+# yield rates are not double-counted.
+#
+# When False (the original path), the existing efficiency Ridges
+# ``rec_td_rate_pred`` / ``rush_td_rate_pred`` × volume are used. Useful
+# for A/B comparison and fast rollback.
+USE_BLENDED_TDS: bool = True
+
+# Optional explosive-play term for the blended TD model. Empirical
+# (2018-2024 REG): explosive completions in the open field score TDs
+# ~8.2% of the time vs. ~0.6% for non-explosive open-field targets;
+# explosive runs in the open field score ~8.6% vs. ~0.5%. The signal is
+# real but it's HEAVILY redundant with the open-field zone share —
+# every open-field TD is, by construction, already in the open-field
+# zone term. We use an INCREMENT formulation: only the rate-delta
+# (rate_explosive - rate_open) is multiplied by the explosive
+# volume × share; the bulk of the open-field rate already covers the
+# non-explosive plays. Empirically the increment formulation still
+# over-predicts league totals (each open TD gets counted partially
+# twice), so the default weight is 0 — the open-field zone term
+# alone covers it. Set non-zero to A/B compare.
+EXPLOSIVE_BLEND_WEIGHT: float = 0.0
 
 SEASON_GAMES: int = 17
 
@@ -131,15 +177,26 @@ class ScoringProjection:
 
 
 def _team_volumes(
-    team_proj: TeamProjection, play_calling: PlayCallingProjection
+    team_proj: TeamProjection,
+    play_calling: PlayCallingProjection,
+    *,
+    ctx: BacktestContext | None = None,
+    zone_fractions: dict[str, float] | None = None,
 ) -> pl.DataFrame:
-    """(team, season=tgt) -> team_targets, team_carries."""
+    """
+    (team, season=tgt) -> team_targets, team_carries.
+
+    When ``ctx`` is provided, we additionally attach per-zone volume
+    columns via :func:`project_team_zone_volumes`. These are consumed
+    by the blended TD path. ``zone_fractions`` allows the caller to
+    pass pre-computed league fractions to avoid re-scanning pbp.
+    """
     team = team_proj.projections.select(
         "team", "season", "plays_per_game_pred"
     )
     pc = play_calling.projections.select("team", "season", "pass_rate_pred")
     merged = team.join(pc, on=["team", "season"], how="left")
-    return merged.with_columns(
+    merged = merged.with_columns(
         (pl.col("plays_per_game_pred") * SEASON_GAMES).alias("team_plays"),
     ).with_columns(
         (pl.col("team_plays") * pl.col("pass_rate_pred")).alias("team_pass_plays"),
@@ -150,6 +207,11 @@ def _team_volumes(
         (pl.col("team_pass_plays") * TARGET_FROM_PASS_PLAY).alias("team_targets"),
         pl.col("team_rush_plays").alias("team_carries"),
     )
+    if ctx is not None:
+        merged = project_team_zone_volumes(
+            ctx, merged, fractions=zone_fractions
+        )
+    return merged
 
 
 def _normalise_team_expr(col: str) -> pl.Expr:
@@ -237,6 +299,167 @@ def _last_team_per_player(history: pl.DataFrame) -> pl.DataFrame:
 # ---------------------------------------------------------------------------
 
 
+def _apply_blended_td_path(
+    merged: pl.DataFrame,
+    *,
+    zone_shares: ZoneShareProjection,
+    zone_td_rates: dict[str, float],
+    explosive_weight: float,
+) -> pl.DataFrame:
+    """
+    Replace the flat ``rec_tds_pred`` / ``rush_tds_pred`` computation
+    with the multi-zone blend.
+
+    Inputs ``merged`` is expected to carry per-team zone volume columns
+    (``team_targets_inside_5``, etc.) — these are added upstream in
+    ``_team_volumes`` via :func:`project_team_zone_volumes`. It must
+    also carry the per-team ``vet_target_ratio_targets`` /
+    ``vet_target_ratio_carries`` columns added by
+    ``_veteran_counting_stats`` BEFORE this function is called; those
+    ratios scale each zone's volume to the fraction the vet pool
+    actually claims (1 - rookie_share - qb_share). Without this,
+    teams with a rookie RB1 would over-attribute zone TDs (the rookie
+    pipeline applies its own flat-rate path on top, double-counting
+    the team's red-zone touches).
+
+    Per-zone player share comes from ``zone_shares`` (left-joined on
+    player_id). Players without zone-share rows (rookies, no priors)
+    fall back to their flat ``targets_pred × rec_td_rate_pred`` etc., so
+    the blended path doesn't strand anyone with zeros.
+
+    Each historical TD is uniquely attributed to the zone the play
+    started in, so summing zone × rate gives the player's total TD
+    expectation without double-counting.
+
+    Explosive term: rate-DELTA over the open-field zone, applied only
+    to the open-field share. This avoids double-counting the explosive
+    plays already inside the open-field zone (an explosive play is, by
+    construction, mostly an open-field play). When the explosive_weight
+    is 0.0, the term collapses to nothing.
+    """
+    merged = merged.join(
+        zone_shares.targets, on="player_id", how="left"
+    ).join(
+        zone_shares.carries, on="player_id", how="left"
+    )
+
+    # Per-player share-scaling factor: ``target_share_pred /
+    # overall_target_share_prior1``. The zone shares were computed
+    # against the player's prior-team historical context (via prior-1
+    # zone touches and prior-1 team zone targets). When the player's
+    # overall target_share_pred changes (team change, share
+    # redistribution from filtered-out players, breakout, depth-chart
+    # reorder, share floor / ceiling), the zone shares should scale
+    # proportionally — otherwise zone TDs are stuck at the prior-team
+    # level. ``zone_specialization`` (zone share / overall share) is the
+    # invariant we preserve. When the prior is zero or null, fall back
+    # to 1.0 (player keeps their static zone share).
+    safe_div_t = pl.when(
+        pl.col("overall_target_share_prior1").fill_null(0.0) > 1e-6
+    ).then(
+        pl.col("target_share_pred").fill_null(0.0)
+        / pl.col("overall_target_share_prior1")
+    ).otherwise(pl.lit(1.0))
+    safe_div_r = pl.when(
+        pl.col("overall_rush_share_prior1").fill_null(0.0) > 1e-6
+    ).then(
+        pl.col("rush_share_pred").fill_null(0.0)
+        / pl.col("overall_rush_share_prior1")
+    ).otherwise(pl.lit(1.0))
+
+    # The vet pool claims `vet_target_ratio` of total team volume; the
+    # remainder belongs to rookies (and QB-rush for the carries side).
+    # Zone volumes scale linearly with overall team volume in our
+    # flat-fraction model, so the same ratio applies per zone. Falls
+    # back to 1.0 if the columns aren't present (caller didn't wire
+    # the partition logic).
+    vet_t = (
+        pl.col("vet_target_ratio_targets")
+        if "vet_target_ratio_targets" in merged.columns
+        else pl.lit(1.0)
+    )
+    vet_r = (
+        pl.col("vet_target_ratio_carries")
+        if "vet_target_ratio_carries" in merged.columns
+        else pl.lit(1.0)
+    )
+
+    # ---- Receiving TDs ----
+    # Σ over zones { share_z × scale × vet_target_ratio × team_zone_volume × zone_td_rate }
+    rec_zone_terms: pl.Expr = pl.lit(0.0)
+    for z in ZONE_NAMES:
+        share_col = f"target_share_{z}_pred"
+        team_vol_col = f"team_targets_{z}"
+        rate = zone_td_rates.get(f"rec_td_rate_{z}", 0.0)
+        rec_zone_terms = rec_zone_terms + (
+            pl.col(share_col).fill_null(0.0)
+            * safe_div_t
+            * vet_t
+            * pl.col(team_vol_col).fill_null(0.0)
+            * rate
+        )
+    # Explosive INCREMENT (rate_explosive − rate_open) × team_explosive ×
+    # explosive_share. Only the increment over the open-field rate is
+    # added so the open-field zone term doesn't get re-counted.
+    rate_open = zone_td_rates.get("rec_td_rate_open", 0.0)
+    rate_expl = zone_td_rates.get("rec_td_rate_explosive", rate_open)
+    rec_explosive_term = (
+        explosive_weight
+        * pl.col("target_share_explosive_pred").fill_null(0.0)
+        * safe_div_t
+        * vet_t
+        * pl.col("team_targets_explosive").fill_null(0.0)
+        * max(rate_expl - rate_open, 0.0)
+    )
+
+    # ---- Rushing TDs ----
+    rush_zone_terms: pl.Expr = pl.lit(0.0)
+    for z in ZONE_NAMES:
+        share_col = f"rush_share_{z}_pred"
+        team_vol_col = f"team_carries_{z}"
+        rate = zone_td_rates.get(f"rush_td_rate_{z}", 0.0)
+        rush_zone_terms = rush_zone_terms + (
+            pl.col(share_col).fill_null(0.0)
+            * safe_div_r
+            * vet_r
+            * pl.col(team_vol_col).fill_null(0.0)
+            * rate
+        )
+    rush_rate_open = zone_td_rates.get("rush_td_rate_open", 0.0)
+    rush_rate_expl = zone_td_rates.get("rush_td_rate_explosive", rush_rate_open)
+    rush_explosive_term = (
+        explosive_weight
+        * pl.col("rush_share_explosive_pred").fill_null(0.0)
+        * safe_div_r
+        * vet_r
+        * pl.col("team_carries_explosive").fill_null(0.0)
+        * max(rush_rate_expl - rush_rate_open, 0.0)
+    )
+
+    # Fallback for players without zone-share rows: use flat rate ×
+    # volume. Detect via ``target_share_inside_5_pred`` being null.
+    flat_rec = (
+        pl.col("targets_pred") * pl.col("rec_td_rate_pred").fill_null(0.0)
+    )
+    flat_rush = (
+        pl.col("carries_pred") * pl.col("rush_td_rate_pred").fill_null(0.0)
+    )
+    has_zone_t = pl.col("target_share_inside_5_pred").is_not_null()
+    has_zone_r = pl.col("rush_share_inside_5_pred").is_not_null()
+
+    merged = merged.with_columns(
+        pl.when(has_zone_t)
+        .then(rec_zone_terms + rec_explosive_term)
+        .otherwise(flat_rec)
+        .alias("rec_tds_pred"),
+        pl.when(has_zone_r)
+        .then(rush_zone_terms + rush_explosive_term)
+        .otherwise(flat_rush)
+        .alias("rush_tds_pred"),
+    )
+    return merged
+
+
 def _veteran_counting_stats(
     ctx: BacktestContext,
     team_vol: pl.DataFrame,
@@ -245,6 +468,10 @@ def _veteran_counting_stats(
     avail: AvailabilityProjection,
     qb: QBProjection | None = None,
     rookies: RookieProjection | None = None,
+    zone_shares: ZoneShareProjection | None = None,
+    zone_td_rates: dict[str, float] | None = None,
+    use_blended_tds: bool = USE_BLENDED_TDS,
+    explosive_weight: float = EXPLOSIVE_BLEND_WEIGHT,
 ) -> pl.DataFrame:
     """
     Build per-veteran counting stats (targets / carries / yds / TDs /
@@ -635,8 +862,10 @@ def _veteran_counting_stats(
     ).drop([
         "_t_w", "_r_w", "_t_e", "_t_n", "_r_e", "_r_n", "_t_norm", "_r_norm",
         "target_share_floor_bound", "rush_share_floor_bound",
-        "vet_target_ratio_targets", "vet_target_ratio_carries",
     ])
+    # NOTE: vet_target_ratio_* are kept here intentionally — the
+    # blended TD path consumes them below to scale zone volumes by
+    # the vet pool's claim. They are dropped after the TD computation.
 
     # Catch rate lookup
     cr = pl.DataFrame(
@@ -649,8 +878,8 @@ def _veteran_counting_stats(
         pl.col("catch_rate").fill_null(0.5)  # unknown position → middling
     )
 
-    # Efficiency rollup — fill nulls with zero so players missing one
-    # metric still get the others computed.
+    # Yardage rollup — always uses the efficiency-Ridge per-target /
+    # per-carry rates. (TDs may be replaced by the blended path below.)
     merged = merged.with_columns(
         (
             pl.col("targets_pred")
@@ -661,17 +890,40 @@ def _veteran_counting_stats(
             * pl.col("yards_per_carry_pred").fill_null(0.0)
         ).alias("rush_yards_pred"),
         (
-            pl.col("targets_pred")
-            * pl.col("rec_td_rate_pred").fill_null(0.0)
-        ).alias("rec_tds_pred"),
-        (
-            pl.col("carries_pred")
-            * pl.col("rush_td_rate_pred").fill_null(0.0)
-        ).alias("rush_tds_pred"),
-        (
             pl.col("targets_pred") * pl.col("catch_rate")
         ).alias("receptions_pred"),
     )
+
+    # ---- TD computation ----
+    # Default: flat rate × volume (efficiency Ridges).
+    # Blended: Σ over zones { player_zone_share × team_zone_volume × zone_td_rate }
+    if use_blended_tds and zone_shares is not None and zone_td_rates is not None:
+        merged = _apply_blended_td_path(
+            merged,
+            zone_shares=zone_shares,
+            zone_td_rates=zone_td_rates,
+            explosive_weight=explosive_weight,
+        )
+    else:
+        merged = merged.with_columns(
+            (
+                pl.col("targets_pred")
+                * pl.col("rec_td_rate_pred").fill_null(0.0)
+            ).alias("rec_tds_pred"),
+            (
+                pl.col("carries_pred")
+                * pl.col("rush_td_rate_pred").fill_null(0.0)
+            ).alias("rush_tds_pred"),
+        )
+    # Now drop the vet_target_ratio_* helpers (held over from share
+    # normalization to feed the blended TD path).
+    drop_cols = [
+        c for c in (
+            "vet_target_ratio_targets", "vet_target_ratio_carries",
+        ) if c in merged.columns
+    ]
+    if drop_cols:
+        merged = merged.drop(drop_cols)
 
     return merged.select(
         "player_id", "player_display_name", "position", "team", "season",
@@ -933,10 +1185,71 @@ def project_fantasy_points(
         availability=availability,
     )
 
-    team_vol = _team_volumes(team, play_calling)
+    # Situational (per-zone) projections for the blended TD path.
+    # Calibrate per-zone TD rates and league zone fractions on the same
+    # historical window we use for everything else (last
+    # ZONE_CALIBRATION_SEASONS seasons before target). Calibrated once
+    # per ctx so we don't re-scan pbp.
+    zone_shares: ZoneShareProjection | None = None
+    zone_td_rates: dict[str, float] | None = None
+    zone_fractions: dict[str, float] | None = None
+    if USE_BLENDED_TDS:
+        try:
+            calibration_seasons = [
+                s for s in ctx.seasons
+                if ctx.target_season - 5 <= s < ctx.target_season
+            ]
+            zone_td_rates = league_zone_td_rates(
+                ctx.pbp, seasons=calibration_seasons
+            )
+            zone_fractions = league_zone_fractions(
+                ctx.pbp, seasons=calibration_seasons
+            )
+            # Add explosive rate (over the same calibration window).
+            base_pa = ctx.pbp.filter(
+                (pl.col("season_type") == "REG")
+                & (pl.col("pass_attempt") == 1)
+                & pl.col("receiver_player_id").is_not_null()
+                & pl.col("season").is_in(calibration_seasons)
+            )
+            base_ra = ctx.pbp.filter(
+                (pl.col("season_type") == "REG")
+                & (pl.col("rush_attempt") == 1)
+                & pl.col("rusher_player_id").is_not_null()
+                & pl.col("season").is_in(calibration_seasons)
+            )
+            expl_t = base_pa.filter(pl.col("air_yards") >= 20)
+            n = expl_t.height
+            zone_td_rates["rec_td_rate_explosive"] = (
+                expl_t.filter(pl.col("pass_touchdown") == 1).height / n
+                if n else 0.0
+            )
+            expl_r = base_ra.filter(pl.col("yards_gained") >= 15)
+            n = expl_r.height
+            zone_td_rates["rush_td_rate_explosive"] = (
+                expl_r.filter(pl.col("rush_touchdown") == 1).height / n
+                if n else 0.0
+            )
+            zone_shares = project_zone_shares(ctx)
+            log.info(
+                "Blended TD path enabled. zone_td_rates=%s",
+                {k: round(v, 4) for k, v in zone_td_rates.items()},
+            )
+        except Exception as e:
+            log.warning(
+                "Situational projection failed (%s); falling back to flat TDs",
+                e,
+            )
+            zone_shares = None
+            zone_td_rates = None
+
+    team_vol = _team_volumes(
+        team, play_calling, ctx=ctx, zone_fractions=zone_fractions,
+    )
     vets = _veteran_counting_stats(
         ctx, team_vol, opportunity, efficiency, availability,
         qb=qb, rookies=rookies,
+        zone_shares=zone_shares, zone_td_rates=zone_td_rates,
     )
     rooks = _rookie_counting_stats(rookies)
     qbs = _qb_counting_stats(qb)
