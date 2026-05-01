@@ -105,7 +105,20 @@ _CFBD_TEAM_LONG_TO_ABBR: dict[str, str] = {
     "New York Jets": "NYJ", "Philadelphia": "PHI", "Pittsburgh": "PIT",
     "San Francisco": "SF", "Seattle": "SEA", "Tampa Bay": "TB",
     "Tennessee": "TEN", "Washington": "WAS",
-    "Los Angeles": "LAR", "New York": "NYG",
+    # Deliberately NOT mapping ambiguous "New York" / "Los Angeles".
+    # Past defaults silently misrouted picks (e.g. Kenyon Sadiq 2026 went
+    # to NYJ but CFBD data only says "New York" → was being mapped to
+    # NYG). Better to leave team null and force nflreadpy to fill it
+    # in 1-2 weeks post-draft than to fabricate a wrong team.
+}
+
+# Hand-curated overrides for ambiguous CFBD picks — name → abbr.
+# Add a row here when a "New York" / "Los Angeles" pick is identified
+# correctly so the rookie projection picks up the team immediately
+# (vs waiting for nflreadpy ingestion). Confirm with NFL.com or
+# pro-football-reference.com before adding.
+_ROOKIE_TEAM_OVERRIDES: dict[str, str] = {
+    "kenyonsadiq": "NYJ",  # 2026 R1, Oregon TE
 }
 
 
@@ -181,6 +194,7 @@ def enrich_rookies(df: pl.DataFrame, season: int) -> pl.DataFrame:
     names = df.get_column("player_display_name").to_list()
     matched_primary = 0
     matched_secondary = 0
+    matched_override = 0
     for i, (pid, team, name) in enumerate(zip(pids, teams, names)):
         if pid is not None and team is not None:
             continue
@@ -195,6 +209,13 @@ def enrich_rookies(df: pl.DataFrame, season: int) -> pl.DataFrame:
                 teams[i] = match["team"]
             matched_primary += 1
             continue
+        # Hand-curated override beats CFBD secondary (CFBD often has
+        # ambiguous "New York" / "Los Angeles" team names).
+        override = _ROOKIE_TEAM_OVERRIDES.get(norm)
+        if override and team is None:
+            teams[i] = override
+            matched_override += 1
+            continue
         if team is None:
             secondary = cfbd_team_index.get(norm)
             if secondary:
@@ -205,10 +226,11 @@ def enrich_rookies(df: pl.DataFrame, season: int) -> pl.DataFrame:
         pl.Series("player_id", pids, dtype=pl.Utf8),
         pl.Series("team", teams, dtype=pl.Utf8),
     )
-    if matched_primary or matched_secondary:
+    if matched_primary or matched_secondary or matched_override:
         log.info(
-            "enrich_rookies: nflreadpy match %d, CFBD cache match %d",
-            matched_primary, matched_secondary,
+            "enrich_rookies: nflreadpy match %d, CFBD cache match %d, "
+            "manual override %d",
+            matched_primary, matched_secondary, matched_override,
         )
     return df
 
