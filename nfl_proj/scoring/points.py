@@ -82,6 +82,10 @@ from nfl_proj.situational.shares import (
     ZoneShareProjection,
     project_zone_shares,
 )
+from nfl_proj.situational.team_volume_ridges import (
+    ZoneVolumeRidges,
+    fit_zone_volume_ridges,
+)
 from nfl_proj.situational.team_volumes import (
     league_zone_fractions,
     project_team_zone_volumes,
@@ -183,6 +187,7 @@ def _team_volumes(
     ctx: BacktestContext | None = None,
     zone_fractions: dict[str, float] | None = None,
     gamescript_games: pl.DataFrame | None = None,
+    zone_ridges: "ZoneVolumeRidges | None" = None,
 ) -> pl.DataFrame:
     """
     (team, season=tgt) -> team_targets, team_carries.
@@ -191,6 +196,8 @@ def _team_volumes(
     columns via :func:`project_team_zone_volumes`. These are consumed
     by the blended TD path. ``zone_fractions`` allows the caller to
     pass pre-computed league fractions to avoid re-scanning pbp.
+    ``zone_ridges`` (when provided) routes the per-team zone fraction
+    through the Ridge path; otherwise the legacy flat-fraction is used.
     """
     team = team_proj.projections.select(
         "team", "season", "plays_per_game_pred"
@@ -212,6 +219,7 @@ def _team_volumes(
         merged = project_team_zone_volumes(
             ctx, merged, fractions=zone_fractions,
             gamescript_games=gamescript_games,
+            zone_ridges=zone_ridges,
         )
     return merged
 
@@ -1262,9 +1270,40 @@ def project_fantasy_points(
             zone_shares = None
             zone_td_rates = None
 
+    # Per-team zone-volume Ridges (one per zone metric). Each Ridge
+    # picks up team-specific zone-distribution drift (heavy-RZ-passing
+    # vs heavy-RZ-rushing teams, scheme persistence). Per-zone
+    # gating: if a Ridge doesn't beat the prior1-carry-forward
+    # baseline by ≥ 5% MAE on the training fold, that zone falls back
+    # to flat-fraction (per-zone, not all-or-nothing). Failure of the
+    # whole fit (e.g. data gaps) silently degrades to all flat.
+    zone_ridges: ZoneVolumeRidges | None = None
+    if zone_fractions is not None:
+        try:
+            zone_ridges = fit_zone_volume_ridges(
+                ctx,
+                team_proj=team,
+                play_calling=play_calling,
+                league_fractions=zone_fractions,
+                gamescript_games=(
+                    gamescript.games if gamescript is not None else None
+                ),
+            )
+            log.info(
+                "Zone-volume Ridges fit: %s used, %s fell back to flat",
+                sum(1 for r in zone_ridges.ridges.values() if r.used),
+                sum(1 for r in zone_ridges.ridges.values() if not r.used),
+            )
+        except Exception as e:
+            log.warning(
+                "Zone-volume Ridges failed (%s); falling back to flat-fraction", e,
+            )
+            zone_ridges = None
+
     team_vol = _team_volumes(
         team, play_calling, ctx=ctx, zone_fractions=zone_fractions,
         gamescript_games=gamescript.games if gamescript is not None else None,
+        zone_ridges=zone_ridges,
     )
     vets = _veteran_counting_stats(
         ctx, team_vol, opportunity, efficiency, availability,
