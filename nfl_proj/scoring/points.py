@@ -343,6 +343,23 @@ def _apply_blended_td_path(
         zone_shares.carries, on="player_id", how="left"
     )
 
+    # LIVE-MODE-ONLY zone-share floor for depth-chart-1 starters. Fixes
+    # the team-changer gap: a goal-line back changing teams (Derrick
+    # Henry TEN→BAL) inherits TEN's prior-year zone shares via the EB
+    # shrinkage, but his BAL role is depth-chart-1 — he should get at
+    # least the league-typical RB1 zone distribution. Same gating as
+    # the existing depth-chart overrides; backtest preseason depth
+    # charts can't anticipate in-season injuries the harness scores.
+    from datetime import date as _date_zone
+    if merged.schema.get("season") is not None:
+        # Pull target_season from the merged frame (all rows share it).
+        target_season_val = int(
+            merged.select(pl.col("season").max()).item()
+        )
+        if target_season_val > _date_zone.today().year - 1:
+            from nfl_proj.opportunity.depth_chart import apply_zone_share_floors
+            merged = apply_zone_share_floors(merged, target_season_val)
+
     # Per-player share-scaling factor: ``target_share_pred /
     # overall_target_share_prior1``. The zone shares were computed
     # against the player's prior-team historical context (via prior-1

@@ -441,3 +441,124 @@ def apply_lead_starter_games_floor(
     ).drop("_games_floor")
 
     return merged
+
+
+# ---------------------------------------------------------------------------
+# Zone-share floors (situational TD model)
+# ---------------------------------------------------------------------------
+
+# Per-(position, depth_rank) zone-share floors. Empirically calibrated
+# from 2019-2023 pbp at the median (p50) of each (position, rank) cell —
+# meaning a depth-chart-1 starter who is below median on a given zone
+# gets floored UP to the median. This fixes the team-changer gap in the
+# blended TD model: a goal-line back changing teams (Derrick Henry
+# TEN→BAL) inherits TEN's zone shares via prior-year aggregation, but
+# his BAL role is depth-chart-1 RB1 — he should get at least the
+# typical RB1 zone shares regardless of his prior team's distribution.
+#
+# Format: (depth_position, depth_rank) → {zone_share_col: floor}.
+# Column names match the projections produced by
+# ``nfl_proj/situational/shares.py``.
+ZONE_STARTER_FLOOR: dict[tuple[str, int], dict[str, float]] = {
+    # RB1 — clear lead back. Inside-5 carry share is the highest-leverage
+    # zone for RB TDs (yield rate ~40%). Median lead-back inside-5 share
+    # is 40% (n=176 historical RB1s).
+    ("RB", 1): {
+        "rush_share_inside_5_pred":      0.40,
+        "rush_share_inside_10_pred":     0.375,
+        "rush_share_rz_outside_10_pred": 0.365,
+        "rush_share_open_pred":          0.41,
+        # Pass-catching backs: median RB1 target shares.
+        "target_share_inside_5_pred":      0.038,
+        "target_share_inside_10_pred":     0.056,
+        "target_share_rz_outside_10_pred": 0.059,
+        "target_share_open_pred":          0.065,
+    },
+    # WR1 alpha — median lead-WR zone target shares.
+    ("WR", 1): {
+        "target_share_inside_5_pred":      0.125,
+        "target_share_inside_10_pred":     0.111,
+        "target_share_rz_outside_10_pred": 0.116,
+        "target_share_open_pred":          0.139,
+    },
+    # TE1 — hub TE; RZ-skewed.
+    ("TE", 1): {
+        "target_share_inside_5_pred":      0.111,
+        "target_share_inside_10_pred":     0.087,
+        "target_share_rz_outside_10_pred": 0.093,
+        "target_share_open_pred":          0.088,
+    },
+    # QB1 — designed-run goal-line concentration.
+    ("QB", 1): {
+        "rush_share_inside_5_pred":      0.130,
+        "rush_share_inside_10_pred":     0.125,
+        "rush_share_rz_outside_10_pred": 0.116,
+        "rush_share_open_pred":          0.090,
+    },
+}
+
+
+def apply_zone_share_floors(
+    merged: pl.DataFrame, season: int
+) -> pl.DataFrame:
+    """
+    Floor predicted per-zone shares at position-typical lead-starter
+    medians for depth-chart-1 starters.
+
+    Mirrors ``apply_depth_chart_floor`` but operates on the zone-share
+    columns produced by ``nfl_proj/situational/shares.py``. Only floors
+    UP — proven workhorses with above-median zone shares are unaffected.
+
+    Specifically fixes the team-changer gap: when a player's zone shares
+    were computed against their PRIOR team's usage and don't reflect
+    their NEW depth-chart-1 role (Derrick Henry TEN→BAL goal-line
+    workload), the floor lifts them to the league-typical RB1 zone
+    distribution.
+
+    No-op when the depth chart frame is empty or the merged frame
+    doesn't carry zone-share columns.
+    """
+    dc = load_starter_depth_chart(season)
+    if dc.height == 0:
+        return merged
+
+    # Build per-row floors keyed on (depth_position, depth_rank).
+    floor_rows: list[dict] = []
+    all_zone_cols: set[str] = set()
+    for (pos, rank), floors in ZONE_STARTER_FLOOR.items():
+        row = {"depth_position": pos, "depth_rank": rank}
+        for col, val in floors.items():
+            row[f"_floor_{col}"] = val
+            all_zone_cols.add(col)
+        floor_rows.append(row)
+    floor_df = pl.DataFrame(floor_rows)
+
+    # Skip any zone columns the caller's frame doesn't have (caller may
+    # be running on the legacy flat-rate path with no zone shares).
+    present_cols = [c for c in all_zone_cols if c in merged.columns]
+    if not present_cols:
+        return merged
+
+    dc_with_floor = dc.join(
+        floor_df, on=["depth_position", "depth_rank"], how="inner"
+    ).select(
+        "player_id", "team",
+        *[f"_floor_{c}" for c in present_cols],
+    )
+
+    merged = merged.join(dc_with_floor, on=["player_id", "team"], how="left")
+    # Fill nulls (non-starters) with 0.0 so the max_horizontal floor
+    # is a no-op for them.
+    fill_exprs = [pl.col(f"_floor_{c}").fill_null(0.0) for c in present_cols]
+    merged = merged.with_columns(fill_exprs)
+
+    floor_exprs = []
+    for c in present_cols:
+        floor_exprs.append(
+            pl.max_horizontal(pl.col(c).fill_null(0.0), pl.col(f"_floor_{c}"))
+              .alias(c)
+        )
+    merged = merged.with_columns(floor_exprs).drop(
+        [f"_floor_{c}" for c in present_cols]
+    )
+    return merged
