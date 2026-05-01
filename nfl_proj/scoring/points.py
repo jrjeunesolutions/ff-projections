@@ -633,12 +633,80 @@ def _veteran_counting_stats(
         )
         .drop(["team_asof", "team_last_observed"])
     )
+
+    # POSITION-MEAN FALLBACK for efficiency rates. The eff projections
+    # only carry a row for players with sufficient prior-year sample
+    # (Ridge needs a minimum). For sub-roster vets / depth-chart bottom
+    # (Braelon Allen, Andrew Beck, Arian Smith, Irvin Charles, ...) the
+    # left join leaves yards_per_target_pred / yards_per_carry_pred /
+    # rec_td_rate_pred / rush_td_rate_pred = NULL. The previous code
+    # then silently fill_null(0.0)-ed these, producing rec_yds=0 even
+    # when targets > 0 — Wilson saw this for his backup WRs in the NYJ
+    # offense audit. Position-mean is a strictly better fallback than 0:
+    # it's the league baseline conditional on position, which is the
+    # most informative prior we have for a player with no own history.
+    eff_means = (
+        eff_f
+        .join(opp_f.select("player_id", "position"), on="player_id", how="left")
+        .group_by("position")
+        .agg(
+            pl.col("yards_per_target_pred").drop_nulls().mean()
+              .alias("ypt_pos_mean"),
+            pl.col("yards_per_carry_pred").drop_nulls().mean()
+              .alias("ypc_pos_mean"),
+            pl.col("rec_td_rate_pred").drop_nulls().mean()
+              .alias("rec_td_pos_mean"),
+            pl.col("rush_td_rate_pred").drop_nulls().mean()
+              .alias("rush_td_pos_mean"),
+        )
+    )
+    merged = merged.join(eff_means, on="position", how="left").with_columns(
+        pl.col("yards_per_target_pred")
+          .fill_null(pl.col("ypt_pos_mean")).fill_null(0.0)
+          .alias("yards_per_target_pred"),
+        pl.col("yards_per_carry_pred")
+          .fill_null(pl.col("ypc_pos_mean")).fill_null(0.0)
+          .alias("yards_per_carry_pred"),
+        pl.col("rec_td_rate_pred")
+          .fill_null(pl.col("rec_td_pos_mean")).fill_null(0.0)
+          .alias("rec_td_rate_pred"),
+        pl.col("rush_td_rate_pred")
+          .fill_null(pl.col("rush_td_pos_mean")).fill_null(0.0)
+          .alias("rush_td_rate_pred"),
+    ).drop([
+        "ypt_pos_mean", "ypc_pos_mean", "rec_td_pos_mean", "rush_td_pos_mean",
+    ])
     if active_pids is not None:
         before_n = merged.height
         merged = merged.filter(pl.col("player_id").is_in(active_pids))
         log.info(
             "_veteran_counting_stats: active-roster filter dropped "
             "%d/%d rows (retired/unsigned/cross-season ghosts)",
+            before_n - merged.height, before_n,
+        )
+
+    # SKILL-POSITION FILTER (added 2026-05-01): drop OL / DB / DL / LB /
+    # K / P from share allocation. The opportunity model occasionally
+    # gives non-skill players non-zero target_share / rush_share (Bo
+    # Melton miscoded as CB at GB with 31 targets, Luke Wypler C at CLE
+    # with 3.8 targets, Trevor Penning OT at LAC with 8.8 targets, ...).
+    # Their rec_yards correctly resolve to 0 (no position-mean for OT/C),
+    # but the BLENDED TD path multiplies their target_share by team
+    # zone TD volume regardless of position fit, producing 1-3.5 phantom
+    # rec_tds (~6-21 PPR each). 16 cases league-wide before this filter
+    # — collectively absorbing ~40 TDs that should have gone to actual
+    # skill players. Filtering PRE-normalization (same pattern as the
+    # QB/rookie dedup below) means their share residual fully
+    # redistributes to vets at RB/WR/TE/FB.
+    SKILL_POSITIONS = {"QB", "RB", "WR", "TE", "FB", "HB"}
+    before_n = merged.height
+    merged = merged.filter(
+        pl.col("position").is_in(list(SKILL_POSITIONS))
+    )
+    if merged.height < before_n:
+        log.info(
+            "_veteran_counting_stats: skill-position filter dropped "
+            "%d/%d rows (OL/DB/DL/LB/K/P miscoded with target/rush share)",
             before_n - merged.height, before_n,
         )
 
@@ -1587,6 +1655,27 @@ def project_fantasy_points(
     else:
         scored = scored.with_columns(
             pl.lit(0.0).alias("qb_situation_adjustment_ppr_pg")
+        )
+
+    # Drop phantom rows where games_pred == 0 but the player accumulated
+    # nonzero downstream stats (e.g. rookie pipeline TD baseline that
+    # bypasses the availability gate, defensive players that slipped
+    # through opp-frame share normalization). These rows can't materialize
+    # — if a player is projected for 0 games, his contribution to a
+    # season total must also be 0. Keep the row only if every counting
+    # stat is also 0 (i.e. truly inert) so downstream consumers don't
+    # see "Quentin Skinner ranked 142 with 5.8 PPR on 0 games."
+    pre_filter_n = scored.height
+    scored = scored.filter(
+        (pl.col("games_pred").fill_null(0.0) > 0.0)
+        | (
+            (pl.col("fantasy_points_pred").fill_null(0.0) <= 1e-9)
+        )
+    )
+    if scored.height < pre_filter_n:
+        log.info(
+            "project_fantasy_points: dropped %d phantom rows (games=0 with ppr>0)",
+            pre_filter_n - scored.height,
         )
 
     ranked = _rank_within_position(scored).sort(
