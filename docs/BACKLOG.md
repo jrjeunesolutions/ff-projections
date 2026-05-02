@@ -184,6 +184,32 @@ Sizing buckets:
 - **Where**: `~/.claude/projects/-Users-jonathanjeune-dev-ffootball-projections/memory/MEMORY.md`
 - **Size**: S (1 line)
 
+### Stale-roster prevention in the front-office agent
+- **Why**: 2026-05-01 issue — agent reasoned about a roster from
+  conversation context after the user had dropped a player on Sleeper,
+  showing dropped players still on the roster. The MCP `get_rosters`
+  tool fetches fresh data on every call (retries 3× against Sleeper
+  API live), so the bug is NOT a cache TTL issue. Two distinct
+  failure modes:
+    1. **Conversation-memory drift (dominant)**: agent doesn't
+       re-call `get_rosters` after roster changes; answers from
+       earlier tool-call context. Fix is a system-prompt directive.
+    2. **Snapshot fallback**: when Sleeper API is flaky, MCP serves
+       the DB snapshot (`nfl_data.db:roster_snapshots`) with
+       `stale: True` flag — but the flag is easy for the agent to
+       silently ignore.
+- **Where**:
+    * `ffootball-research/studies/front_office.py` — add
+      "always re-fetch rosters before answering" directive to the
+      `personnel` and `roster` role system prompts
+    * `fantasy-football-mcp-public/nfl_mcp/nfl_mcp/sleeper_tools.py:get_rosters`
+      — make the stale flag loud (prefix the response with a visible
+      "⚠️ STALE" marker, include `data_fresh: bool` and
+      `snapshot_age_seconds` in the success-path response too)
+    * (Optional) Add a `get_rosters_force_refresh` MCP tool variant
+      that bypasses snapshot fallback for high-stakes moments.
+- **Size**: S (system-prompt directive) + S (MCP staleness markers)
+
 ### Auto-trigger ff-research context regen on projection refresh
 - **Why**: `ffootball-research/scripts/generate_projections_context.py`
   reads the latest projection parquet and writes the front-office
