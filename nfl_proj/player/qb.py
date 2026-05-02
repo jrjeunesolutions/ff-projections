@@ -804,6 +804,28 @@ def project_qb(
                       .alias("games_pred"),
                 )
 
+            # Step 1b (added 2026-05-01): floor QB1 qb_share_pred at
+            # 0.85 too. Without this, depth-chart-promoted starters
+            # whose career was QB2 (Malik Willis MIA after Tua to ATL,
+            # etc.) keep their backup-era qb_share (~0.20), producing
+            # team pass attempts of ~130 vs the realistic 480-540 for
+            # a 17-game starter. The 0.85 floor matches the typical
+            # share an established starter holds (rest goes to mop-up
+            # and injury backups). Pairs with the games floor (15.5g)
+            # to give a coherent QB1 volume projection.
+            QB1_SHARE_FLOOR: float = 0.85
+            merged = merged.with_columns(
+                pl.when(pl.col("depth_rank") == 1)
+                  .then(
+                      pl.max_horizontal(
+                          pl.col("qb_share_pred"),
+                          pl.lit(QB1_SHARE_FLOOR),
+                      )
+                  )
+                  .otherwise(pl.col("qb_share_pred"))
+                  .alias("qb_share_pred"),
+            )
+
             # Step 2: team-constrained joint allocation. Compute
             # p_QB1 from each team's QB1 floored games_pred; apply
             # joint probability formula to QB2 and below.

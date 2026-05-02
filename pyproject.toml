@@ -27,6 +27,7 @@ dependencies = [
     "rich>=13.7.0",
     # Fuzzy name matching (prospect ↔ draft picks, Phase 8c Part 0.5)
     "rapidfuzz>=3.9.0",
+    "streamlit>=1.57.0",
 ]
 
 [project.optional-dependencies]
