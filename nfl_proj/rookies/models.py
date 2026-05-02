@@ -118,8 +118,26 @@ _CFBD_TEAM_LONG_TO_ABBR: dict[str, str] = {
 # correctly so the rookie projection picks up the team immediately
 # (vs waiting for nflreadpy ingestion). Confirm with NFL.com or
 # pro-football-reference.com before adding.
+#
+# Use cases include:
+#   * Name variant (rookie projection name ≠ nflreadpy roster name).
+#     Concepcion is "Kevin" in CFBD but "KC" in nflreadpy → norm-name
+#     match misses → override needed. Same pattern for Reggie/Reginald
+#     Virgil, Mike/Michael Washington, Brenen/Deven Thompson.
+#   * "New York" / "Los Angeles" CFBD ambiguity.
+#   * Pre-nflreadpy-ingestion gap (1-2 wks post-draft).
 _ROOKIE_TEAM_OVERRIDES: dict[str, str] = {
-    "kenyonsadiq": "NYJ",  # 2026 R1, Oregon TE
+    "kenyonsadiq": "NYJ",         # 2026 R1, Oregon TE
+    "kevinconcepcion": "CLE",     # 2026 R1 P24, "KC" Concepcion, Texas A&M WR
+    "michaelwashington": "LV",    # 2026 R4 P122, "Mike" Washington Jr., Arkansas RB
+    "jarelwashington": "LV",      # alias collision with Michael Washington
+    "bralonbrown": "NO",          # 2026 R6 P190, "Barion" Brown, LSU WR
+    "deventhompson": "LAC",       # 2026 R4 P105, "Brenen" Thompson, Mississippi St. WR
+    "djallen": "KC",              # 2026 R5 P176, "Cyrus" Allen, Cincinnati WR
+    "reginaldvirgil": "ARI",      # 2026 R5 P143, "Reggie" Virgil, Texas Tech WR
+    # DJ Williams (QB R7) and E.J. Williams (WR R7) had no clear nflreadpy
+    # draft match — likely UDFAs misclassified upstream. Leave nullable
+    # rather than guess.
 }
 
 
