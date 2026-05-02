@@ -184,6 +184,26 @@ Sizing buckets:
 - **Where**: `~/.claude/projects/-Users-jonathanjeune-dev-ffootball-projections/memory/MEMORY.md`
 - **Size**: S (1 line)
 
+### Auto-trigger ff-research context regen on projection refresh
+- **Why**: `ffootball-research/scripts/generate_projections_context.py`
+  reads the latest projection parquet and writes the front-office
+  context markdowns (`studies/projections_2026.md`,
+  `studies/veteran_value_2026.md`) that `studies/front_office.py`
+  consumes. Today the regen is manual — running
+  `refresh_projections.py` here doesn't propagate to the research
+  repo. The staleness was discovered today (May 1): all model fixes
+  landed in projections, but the front-office multi-role agent was
+  still reasoning over the Apr 30 numbers (Dart at 204.9 PPR, Mendoza
+  at 41 PPR, Concepcion team=?, etc.). Fixed by manual re-run; needs
+  automation. Two options:
+    * Add a post-refresh hook in `scripts/refresh_projections.py`
+      that shells out to the research repo's regen script
+    * Move the regen into a scheduled routine that fires after the
+      weekly OC refresh (Mondays Feb-Mar)
+- **Where**: `scripts/refresh_projections.py` (this repo) +
+  `ffootball-research/scripts/generate_projections_context.py`
+- **Size**: S (one subprocess.run; cross-repo path is hardcoded)
+
 ---
 
 ## Research-level / speculative
