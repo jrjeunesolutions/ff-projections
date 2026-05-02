@@ -184,6 +184,57 @@ Sizing buckets:
 - **Where**: `~/.claude/projects/-Users-jonathanjeune-dev-ffootball-projections/memory/MEMORY.md`
 - **Size**: S (1 line)
 
+### Multi-user rollout for the front-office agent
+- **Why**: today the front-office agent assumes a single user — `user_id`,
+  `username`, league configs, and `active_league.txt` are all hand-curated
+  for one person. To let other dynasty managers use the same system on
+  their leagues, we need user identity resolution, league discovery,
+  per-user storage, and (eventually) provider auth beyond Sleeper.
+- **Where**: `ff-research/scripts/setup_user.py` (new),
+  `ff-research/studies/league_state.py` (per-user config dispatch),
+  `ff-research/config/league_config.py` (multi-user namespace).
+- **Phased plan** (do not jump phases without demand evidence):
+
+  **Phase 1 — Sleeper bootstrap CLI** (S, ~half-day)
+  Build `scripts/setup_user.py`:
+    1. `front-office setup --sleeper-username <X>` resolves
+       username → user_id via `/v1/user/<username>`
+    2. Fetches leagues for current + previous season via
+       `/v1/user/<user_id>/leagues/nfl/<season>`
+    3. Prompts user to select which leagues to track
+    4. Writes one `config/leagues/<slug>.json` per selection with
+       auto-resolved league_id, roster_id, name, format, season
+    5. Sets first selection as active
+  Distribution = Model A (self-host: clone repo, run command).
+  Anthropic costs paid by each user via their own ANTHROPIC_API_KEY.
+  Eliminates the hand-crafted-JSON friction that caused this session's
+  wrong-league_id bug.
+
+  **Phase 2 — Yahoo provider** (M, ~1 day)
+  Wire `_fetch_yahoo` in `studies/league_state.py` using the existing
+  `fantasy-football-mcp-public/yahoo_api_utils.py` OAuth flow. Token
+  storage local (per-user). Lets users with Yahoo leagues onboard the
+  same way. MFL is similar effort whenever someone needs it (per-league
+  API key entered at setup time).
+
+  **Phase 3 — Hosted SaaS** (XL, multi-week — DEFER until adoption signal)
+  Web UI for non-technical users. Server-side config DB, multi-tenant
+  Anthropic API spend with cost-recovery model, hosting + auth + secrets +
+  support burden. Major scope expansion; only worth it if Phase 1 finds
+  real adopters who ask for it.
+
+- **Decision points**:
+  * Phase 1 → ship as Python package (`pip install front-office-fantasy`)
+    or repo clone? Package = lower install friction; repo = cleaner
+    hackability. Probably ship both: PyPI package that bootstraps from
+    the same repo source.
+  * Phase 3 trigger: ≥10 Phase-1 adopters explicitly asking for web UI,
+    OR your own usage hitting Phase-1 friction (multi-device, etc.)
+- **Anti-goals**: don't build hosted SaaS speculatively. Don't add
+  multi-tenant DB / auth before there are >1 active users. Don't
+  prematurely abstract single-user paths.
+- **Size**: Phase 1 = S; Phase 2 = M; Phase 3 = XL (deferred).
+
 ### Vendor custom nfl_mcp code under version control
 - **Why**: 2026-05-01 — when implementing the get_rosters staleness
   markers (freshness_note / data_freshness fields), discovered the
