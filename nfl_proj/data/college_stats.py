@@ -45,11 +45,21 @@ log = logging.getLogger(__name__)
 # in rookies.models. The hard-coded path is acceptable because it's a
 # *primary source* with a documented fallback to the manual CSV when
 # missing.
+#
+# 2026-05-02: ff-research moved out of OneDrive into ~/dev/ff-research.
+# Falls back to the legacy OneDrive path if the new path is missing
+# (covers the case where someone hasn't run the migration yet).
 _PFF_NCAA_RECEIVING_DEFAULT = Path(
+    "/Users/jonathanjeune/dev/ff-research/imported-data/"
+    "pff_ncaa_receiving.csv"
+)
+_PFF_NCAA_RECEIVING_LEGACY = Path(
     "/Users/jonathanjeune/Library/CloudStorage/OneDrive-Personal/"
     "Fantasy Football/ffootball-research/imported-data/"
     "pff_ncaa_receiving.csv"
 )
+if not _PFF_NCAA_RECEIVING_DEFAULT.exists() and _PFF_NCAA_RECEIVING_LEGACY.exists():
+    _PFF_NCAA_RECEIVING_DEFAULT = _PFF_NCAA_RECEIVING_LEGACY
 
 # Manual override CSV under this repo. Use the same `data/external/*.csv`
 # pattern as fa_signings_2026.csv.

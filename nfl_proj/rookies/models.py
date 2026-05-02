@@ -89,11 +89,21 @@ log = logging.getLogger(__name__)
 # CFBD picks cache; we read it as secondary. The hard-coded path is
 # acceptable here because it's a *fallback* — the projections module
 # still runs without it (rookies just stay team-less in that case).
+#
+# 2026-05-02: ff-research moved out of OneDrive into ~/dev/ff-research.
+# Falls back to the legacy OneDrive path if the new path is missing
+# (covers the case where someone hasn't run the migration yet).
 _CFBD_PICKS_CACHE_DEFAULT = Path(
+    "/Users/jonathanjeune/dev/ff-research/imported-data/"
+    "official_draft_picks_cache.json"
+)
+_CFBD_PICKS_CACHE_LEGACY = Path(
     "/Users/jonathanjeune/Library/CloudStorage/OneDrive-Personal/"
     "Fantasy Football/ffootball-research/imported-data/"
     "official_draft_picks_cache.json"
 )
+if not _CFBD_PICKS_CACHE_DEFAULT.exists() and _CFBD_PICKS_CACHE_LEGACY.exists():
+    _CFBD_PICKS_CACHE_DEFAULT = _CFBD_PICKS_CACHE_LEGACY
 
 _CFBD_TEAM_LONG_TO_ABBR: dict[str, str] = {
     "Arizona": "ARI", "Atlanta": "ATL", "Baltimore": "BAL", "Buffalo": "BUF",
