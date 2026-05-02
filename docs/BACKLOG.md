@@ -184,6 +184,27 @@ Sizing buckets:
 - **Where**: `~/.claude/projects/-Users-jonathanjeune-dev-ffootball-projections/memory/MEMORY.md`
 - **Size**: S (1 line)
 
+### Vendor custom nfl_mcp code under version control
+- **Why**: 2026-05-01 — when implementing the get_rosters staleness
+  markers (freshness_note / data_freshness fields), discovered the
+  customized `nfl_mcp/` subtree inside
+  `ffootball-research/fantasy-football-mcp-public/` is **untracked**.
+  The fork was cloned from upstream (derekrbreese/fantasy-football-mcp-public)
+  and the user's custom MCP code lives in the local-only `nfl_mcp/`
+  directory. So far this has worked because the running MCP server reads
+  from disk, but every customization is effectively unbacked-up — a
+  cloud-storage hiccup or accidental rm would lose it.
+- **Where**: decide between three options:
+    1. Vendor `nfl_mcp/` into the parent `ffootball-research` repo as a
+       tracked subdirectory (e.g. `ffootball-research/mcp_servers/nfl_mcp/`),
+       update Claude Desktop config to point there
+    2. Create a private fork of `derekrbreese/fantasy-football-mcp-public`,
+       commit the `nfl_mcp/` additions there, set as the upstream remote
+    3. Extract `nfl_mcp/` into its own repo (e.g.
+       `jrjeunesolutions/nfl-mcp`), Claude Desktop config points to its clone
+- **Size**: S (option 1 — single mv + git add) to M (option 3 — new repo,
+  proper packaging)
+
 ### Stale-roster prevention in the front-office agent
 - **Why**: 2026-05-01 issue — agent reasoned about a roster from
   conversation context after the user had dropped a player on Sleeper,
