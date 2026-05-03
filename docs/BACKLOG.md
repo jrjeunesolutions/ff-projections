@@ -235,6 +235,30 @@ Sizing buckets:
   prematurely abstract single-user paths.
 - **Size**: Phase 1 = S; Phase 2 = M; Phase 3 = XL (deferred).
 
+### Layer C: WR/RB/TE format_mult KTC calibration + scoring-factor wiring
+- **Why**: Layer B (2026-05-03) fixed the catastrophic QB SF format_mult
+  bug by replacing the `qb_scarcity / 0.75` divisor with a KTC-anchored
+  linear fit. The non-QB formulas remain heuristic anchor-point
+  calculations (`min(wr_slots/5, 1.3)`, `min(rb_slots/4, 1.2)`,
+  `te_value_boost = 1 + 0.15·te_premium_bonus`) that work OK for Full PPR +
+  standard slot configurations but aren't market-calibrated. Two scoring
+  factors are also read from league configs but never used in
+  format_mult: `ppr_multiplier` (half/standard/1.5-PPR) and
+  `pass_td_points` (4 vs 6). Half-PPR leagues currently use Full PPR
+  multipliers; 6-pt-pass-TD leagues underprice QBs by ~10-15%.
+- **Where**: `studies/veteran_value_model.py:_format_multiplier_for_position`,
+  `studies/landing_spot_context.py` (~line 1769),
+  `config/league_config.py:get_ranking_adjustments`. KTC anchors should
+  live next to the QB anchors with same calibration discipline.
+- **Why-not-now**: User's 13 leagues are all SF or 1QB Full PPR with
+  TEP — the existing heuristics produce roughly market-aligned values
+  for that subset. Layer C is needed for non-Full-PPR leagues, 6-pt-pass-TD
+  leagues, and anyone calibrating to KTC for tighter fit. Estimated
+  ~1-2 days of work + KTC scrape for anchors.
+- **Size**: M (~1.5 days). Phase 1: WR/RB/TE linear fits anchored to KTC
+  (4-6 hours). Phase 2: ppr_multiplier wiring + scaling table (3-4 hours).
+  Phase 3: pass_td_points scaling for QB (2-3 hours).
+
 ### Vendor custom nfl_mcp code under version control
 - **Why**: 2026-05-01 — when implementing the get_rosters staleness
   markers (freshness_note / data_freshness fields), discovered the
