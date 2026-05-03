@@ -166,18 +166,47 @@ def fit_metric_model(
     )
 
 
+# 2026-05-04 — RESIDUAL_WEIGHT controls how much of the Ridge's regression
+# correction we apply on top of the baseline. Tuned via Pareto sweep:
+#
+#   residual_weight  range_2025  MAE_2025
+#                0.0      14.79     3.575   (baseline only)
+#                0.5      10.83     3.312   ← chosen
+#                1.0       7.16     3.240   (pure ridge — old behavior)
+#
+# The pure-ridge default (residual_weight=1.0) optimizes minimum MAE but
+# collapses the team-level prediction range to ~50% of historical actuals.
+# That compression propagates downstream: team yards-per-play projections
+# end up too uniform across teams (mean too high, bottom-team floor too
+# high), which inflates volume projections for vets in mediocre offenses
+# and caps elite-RB projections in elite offenses.
+#
+# 50% blend recovers +50% of range for only +2.2% MAE cost. Net win for
+# the dynasty pipeline downstream of this layer.
+RESIDUAL_WEIGHT: float = 0.5
+
+
 def predict_metric(
     trained: TrainedMetricModel,
     ts: pl.DataFrame,
+    *,
+    residual_weight: float | None = None,
 ) -> pl.DataFrame:
     """
     Apply ``trained`` to every row of ``ts`` that has at least one prior.
 
-    Returns (team, season, pred, baseline) where ``pred = baseline +
-    ridge(X)``. Rows without any populated prior are dropped (no signal).
-    Rows without a baseline are dropped too (we can't produce a residual-
-    corrected prediction without one).
+    Returns (team, season, pred, baseline) where
+    ``pred = baseline + residual_weight × ridge(X)``. Rows without any
+    populated prior are dropped (no signal). Rows without a baseline are
+    dropped too (we can't produce a residual-corrected prediction without
+    one).
+
+    residual_weight: how much of the Ridge correction to apply (0.0 =
+        baseline only, 1.0 = full Ridge correction). Defaults to module
+        constant RESIDUAL_WEIGHT (0.5). See module docstring for tuning.
     """
+    if residual_weight is None:
+        residual_weight = RESIDUAL_WEIGHT
     frame = _metric_frame(ts, trained.metric)
     usable = frame.filter(
         pl.col("baseline").is_not_null()
@@ -195,7 +224,7 @@ def predict_metric(
     X = usable.select(*FEATURE_COLS).to_numpy()
     residuals = trained.model.predict(X)
     base = usable["baseline"].to_numpy()
-    preds = base + residuals
+    preds = base + residual_weight * residuals
     return usable.select("team", "season", "baseline").with_columns(
         pl.Series("pred", preds)
     )
