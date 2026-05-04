@@ -531,16 +531,48 @@ def apply_depth_chart_ceiling(
 # the prior-year games count is no longer the right baseline — they're
 # expected to play a full healthy season in the new role. Floor them
 # at the league-typical lead-starter games count.
+#
+# 2026-05-04 — extended to include RB2/RB3, WR2/WR3/WR4, TE2.
+# Reasoning: NFL backups at these depth ranks are typically ACTIVE for
+# most game weeks even when not starting. Raw availability projections
+# (which weight by prior-year games played) systematically under-predict
+# them — a backup who only got snaps in 6 weeks last year is still on
+# the active roster for ~14-16 weeks, just not playing meaningful snaps.
+# Without this floor, the share normalization in scoring/points.py over-
+# weights the lead starter (their full-season weight dominates the
+# weighted share denominator). Concrete case: Javonte Williams DAL
+# projected 320 carries (+27% YoY) because Davis/Blue/Abanikanda all
+# had games_pred 5-6.5 — the floor extension caps backup-dilution and
+# Javonte projects ~256 (matches 2025 actual ~252).
 LEAD_STARTER_GAMES_FLOOR: dict[str, float] = {
-    # League-typical games-played for healthy starters at each position.
-    # WR1 / TE1 / QB1 floors bumped on 2026-05-01: a healthy alpha
-    # plays 16-17 games (Chase/Jefferson/ARSB) — 14.5 was tuned for
-    # RB1 (more injury-prone) and underpredicted healthy WR1 / TE1
-    # availability after injury-shortened priors (Garrett Wilson 2025).
-    "RB": 14.5,  # RBs are more injury-prone; keep at 14.5.
+    "RB": 14.5,  # RBs more injury-prone; keep RB1 at 14.5.
     "WR": 16.0,  # Healthy alphas typically 16-17 games.
     "TE": 15.5,  # TEs slightly more injury-prone than WRs.
     "QB": 15.5,  # QB1s usually 15-17 games.
+}
+
+# Per-(position, depth_rank) games_pred floors — extended for backups.
+# Active-roster game-week presence: an RB2 typically dresses for 14+
+# weeks, an RB3 for ~12, an RB4 for ~9 (last RB on roster, often
+# scratch). Same logic at WR/TE.
+BACKUP_GAMES_FLOOR: dict[tuple[str, int], float] = {
+    # RB
+    ("RB", 1): 14.5,
+    ("RB", 2): 13.0,
+    ("RB", 3): 11.0,
+    ("RB", 4): 9.0,
+    # WR
+    ("WR", 1): 16.0,
+    ("WR", 2): 15.0,
+    ("WR", 3): 13.0,
+    ("WR", 4): 11.0,
+    ("WR", 5): 9.0,
+    # TE
+    ("TE", 1): 15.5,
+    ("TE", 2): 13.0,
+    ("TE", 3): 10.0,
+    # QB — only floor QB1 (backups rarely play meaningful snaps).
+    ("QB", 1): 15.5,
 }
 
 
@@ -562,18 +594,35 @@ def apply_lead_starter_games_floor(
     if dc.height == 0:
         return merged
 
+    # 2026-05-04 — use BACKUP_GAMES_FLOOR (extended table) instead of
+    # LEAD_STARTER_GAMES_FLOOR (rank-1 only). Floors backups at realistic
+    # active-roster-week counts to prevent the share-normalization bug
+    # where availability dilution dumps backup carries onto the lead
+    # starter (Javonte 320 carries case).
     floor_rows = [
-        {"depth_position": pos, "depth_rank": 1, "_games_floor": floor}
-        for pos, floor in LEAD_STARTER_GAMES_FLOOR.items()
+        {"depth_position": pos, "depth_rank": rank, "_games_floor": floor}
+        for (pos, rank), floor in BACKUP_GAMES_FLOOR.items()
     ]
     floor_df = pl.DataFrame(floor_rows)
     starters = dc.join(
         floor_df, on=["depth_position", "depth_rank"], how="inner"
     ).select("player_id", "team", "_games_floor")
 
-    merged = merged.join(starters, on=["player_id", "team"], how="left").with_columns(
-        pl.col("_games_floor").fill_null(0.0),
-    )
+    # 2026-05-04 — DO NOT fill_null _games_floor with 0.0. Previously this
+    # filled non-lead-starter rows with _games_floor=0.0, then
+    # max_horizontal(games_pred=null, _games_floor=0.0) returned 0.0 for
+    # any non-lead player whose games_pred was null (i.e., player not in
+    # availability projections — common for low-sample backups). That zero
+    # then propagated through games_scalar → carries_pred=0 → final
+    # filter dropped them. Phil Mafah (DAL RB4, 2025 R7 with only 5
+    # career carries) was the canonical case: missing from final
+    # projection entirely despite being on roster + depth chart.
+    #
+    # Fix: keep _games_floor as null for non-lead-starters. max_horizontal
+    # treats null as missing, so max(games_pred, null) returns games_pred
+    # (preserving the original value, which gets filled to SEASON_GAMES
+    # downstream by the standard fill_null in scoring/points.py).
+    merged = merged.join(starters, on=["player_id", "team"], how="left")
     # Skip the floor when a manual override is present — the user's
     # explicit attestation about expected games beats the
     # position-typical floor. ``is_games_overridden`` is set in
